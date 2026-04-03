@@ -16,7 +16,7 @@ RUN apt-get update -qq && apt-get install -y --no-install-recommends \
         zlib1g-dev libbz2-dev liblzma-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# VSEARCH 2.23.0 — prebuilt binary
+# VSEARCH 2.23.0
 RUN VSEARCH_VERSION=2.23.0 && \
     wget -q https://github.com/torognes/vsearch/releases/download/v${VSEARCH_VERSION}/vsearch-${VSEARCH_VERSION}-linux-x86_64.tar.gz && \
     tar -xzf vsearch-${VSEARCH_VERSION}-linux-x86_64.tar.gz && \
@@ -29,18 +29,17 @@ RUN R --no-save --no-restore -e "\
     options(repos = c(CRAN = 'https://cloud.r-project.org')); \
     install.packages(c('tidyverse','data.table','here','vegan','changepoint', \
                        'patchwork','gridExtra','ggrepel','fs', \
-                       'scales','digest','tibble'), dependencies = TRUE)"
+                       'scales','digest','tibble','magick'), dependencies = TRUE)"
 
-# magick — separate layer as it requires ImageMagick system libs
+# microeco dependencies installed explicitly first
 RUN R --no-save --no-restore -e "\
     options(repos = c(CRAN = 'https://cloud.r-project.org')); \
-    install.packages('magick', dependencies = TRUE)"
+    install.packages(c('R6','ape','igraph','irr', \
+                       'reshape2','GUniFrac','vegan','picante', \
+                       'agricolae','ggpubr','randomForest','rfPermute'), \
+                     dependencies = TRUE)"
 
-# Ecological/network packages — separate layer as microeco has many deps
-RUN R --no-save --no-restore -e "\
-    options(repos = c(CRAN = 'https://cloud.r-project.org')); \
-    install.packages(c('irr','ape','igraph'), dependencies = TRUE)"
-
+# microeco itself
 RUN R --no-save --no-restore -e "\
     options(repos = c(CRAN = 'https://cloud.r-project.org')); \
     install.packages('microeco', dependencies = TRUE)"
@@ -51,15 +50,17 @@ RUN R --no-save --no-restore -e "\
         install.packages('BiocManager', repos = 'https://cloud.r-project.org'); \
     BiocManager::install(c('Biostrings','DECIPHER'), ask = FALSE, update = FALSE)"
 
-# Verify — prints which packages are missing before failing
+# Verify — print status of every package
 RUN R --no-save --no-restore -e "\
     pkgs <- c('tidyverse','Biostrings','DECIPHER','vegan','changepoint','magick','here', \
-              'data.table','irr','ape','igraph','microeco'); \
+              'data.table','irr','ape','igraph','microeco','R6'); \
     status <- sapply(pkgs, requireNamespace, quietly = TRUE); \
     cat('Package status:\n'); \
-    for (i in seq_along(pkgs)) cat(sprintf('  %-20s %s\n', pkgs[i], ifelse(status[i], 'OK', 'MISSING'))); \
+    for (i in seq_along(pkgs)) { \
+        cat(sprintf('  %-20s %s\n', pkgs[i], ifelse(status[i], 'OK', 'MISSING'))) \
+    }; \
     missing <- pkgs[!status]; \
-    if (length(missing) > 0) stop(paste('Missing packages:', paste(missing, collapse=', ')))"
+    if (length(missing) > 0) stop(paste('Missing:', paste(missing, collapse=', ')))"
 
 RUN vsearch --version
 
