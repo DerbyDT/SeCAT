@@ -1,65 +1,61 @@
-name: Build and Push Container
+﻿name: Build and Push Container
 
 on:
   push:
     branches:
       - main
     paths:
-      - 'containers/secat.def'        # rebuild only when the definition changes
+      - 'containers/Dockerfile'
+      - 'containers/secat.def'
   release:
-    types: [published]                # also build on tagged releases
+    types: [published]
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write                 # required to push to GHCR
+      packages: write
 
     steps:
 
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Singularity
-        uses: eWaterCycle/setup-singularity@v7
-        with:
-          singularity-version: 3.8.7
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
-        run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | \
-          singularity remote login \
-            --username ${{ github.actor }} \
-            --password-stdin \
-            oras://ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Determine image tags
         id: tags
         run: |
-          # Always push 'latest' on main branch builds
-          TAGS="oras://ghcr.io/derbydt/secat:latest"
-          # On a tagged release, also push the version tag
+          TAGS="ghcr.io/derbydt/secat:latest"
           if [ "${{ github.event_name }}" == "release" ]; then
             VERSION="${{ github.event.release.tag_name }}"
-            # Strip leading 'v' if present (e.g. v4.1 -> 4.1)
             VERSION="${VERSION#v}"
-            TAGS="$TAGS oras://ghcr.io/derbydt/secat:${VERSION}"
+            TAGS="$TAGS,ghcr.io/derbydt/secat:${VERSION}"
           fi
           echo "tags=$TAGS" >> $GITHUB_OUTPUT
-          echo "Building with tags: $TAGS"
 
-      - name: Build Singularity image
-        run: |
-          sudo singularity build secat.sif containers/secat.def
+      - name: Build and push Docker image to GHCR
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: containers/Dockerfile
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-      - name: Push image(s) to GHCR
+      - name: Verify image
         run: |
-          for TAG in ${{ steps.tags.outputs.tags }}; do
-            echo "Pushing: $TAG"
-            singularity push secat.sif "$TAG"
-          done
-
-      - name: Verify image is accessible
-        run: |
-          singularity inspect oras://ghcr.io/derbydt/secat:latest
+          docker pull ghcr.io/derbydt/secat:latest
+          docker run --rm ghcr.io/derbydt/secat:latest \
+              Rscript -e "library(DECIPHER); library(vegan); cat('Packages OK\n')"
+          docker run --rm ghcr.io/derbydt/secat:latest vsearch --version
