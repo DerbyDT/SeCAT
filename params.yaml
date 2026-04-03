@@ -79,6 +79,10 @@ harmonize_metadata: true
 plot_dpi:         300
 force_regenerate: false
 
+# ── Alignment ────────────────────────────────────────────────────────────────
+use_all_asvs_for_mafft: true   # use all ASVs for DECIPHER alignment (false = subsample)
+asv_sample_size:        500    # subsample size when use_all_asvs_for_mafft is false
+
 # ── Pipeline stages ───────────────────────────────────────────────────────────
 auto_trim:      false   # trim automatically after verdict (skips manual review)
 run_validation: true    # run multi-tier ecological validation after merge

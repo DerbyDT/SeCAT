@@ -23,8 +23,6 @@ process STUDY_MAPPING {
     export SECAT_ALIGNMENT_MODE="${params.reference_alignment_mode}"
     export SECAT_SUBSET_SIZE="${params.reference_subset_size}"
     export SECAT_USE_ALL_ASVS="${params.use_all_asvs_for_mafft}"
-    export SECAT_MAFFT_PATH="mafft"  # binary is on PATH inside container
-    export SECAT_MAFFT_OPTIONS="${params.mafft_extra_options}"
     export SECAT_VSEARCH_PATH="vsearch"  # binary is on PATH inside container
     export SECAT_ALIGNMENT_METHOD="${params.study_alignment_method}"
     export SECAT_OUTDIR="${params.outdir}"

@@ -81,8 +81,6 @@ tryCatch({
   # Package global variables into a clean list for the function API
   config_list <- list(
     ANALYSIS_MODE = ANALYSIS_MODE,
-    MAFFT_PATH = MAFFT_PATH, # (Note: MAFFT_PATH variable exists but DECIPHER is default)
-    MAFFT_EXTRA_OPTIONS = MAFFT_EXTRA_OPTIONS,
     USE_ALL_ASVS_FOR_MAFFT = USE_ALL_ASVS_FOR_MAFFT,
     ASV_SAMPLE_SIZE = ASV_SAMPLE_SIZE,
     STUDY_ALIGNMENT_METHOD = STUDY_ALIGNMENT_METHOD,
