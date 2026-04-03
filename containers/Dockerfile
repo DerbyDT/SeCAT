@@ -50,3 +50,5 @@ LABEL org.opencontainers.image.title="SeCAT"
 LABEL org.opencontainers.image.description="Sequence Consensus Amplicon Trimming v4.1"
 LABEL org.opencontainers.image.version="4.1"
 LABEL org.opencontainers.image.source="https://github.com/DerbyDT/SeCAT"
+
+# trigger rebuild
