@@ -24,27 +24,42 @@ RUN VSEARCH_VERSION=2.23.0 && \
     chmod +x /usr/local/bin/vsearch && \
     rm -rf vsearch-${VSEARCH_VERSION}-linux-x86_64*
 
-# CRAN R packages
+# Core CRAN packages
 RUN R --no-save --no-restore -e "\
     options(repos = c(CRAN = 'https://cloud.r-project.org')); \
     install.packages(c('tidyverse','data.table','here','vegan','changepoint', \
-                       'magick','patchwork','gridExtra','ggrepel','fs', \
-                       'scales','digest','tibble', \
-                       'irr','ape','igraph','microeco'), dependencies = TRUE)"
+                       'patchwork','gridExtra','ggrepel','fs', \
+                       'scales','digest','tibble'), dependencies = TRUE)"
 
-# Bioconductor: Biostrings and DECIPHER (handles all alignment)
+# magick — separate layer as it requires ImageMagick system libs
+RUN R --no-save --no-restore -e "\
+    options(repos = c(CRAN = 'https://cloud.r-project.org')); \
+    install.packages('magick', dependencies = TRUE)"
+
+# Ecological/network packages — separate layer as microeco has many deps
+RUN R --no-save --no-restore -e "\
+    options(repos = c(CRAN = 'https://cloud.r-project.org')); \
+    install.packages(c('irr','ape','igraph'), dependencies = TRUE)"
+
+RUN R --no-save --no-restore -e "\
+    options(repos = c(CRAN = 'https://cloud.r-project.org')); \
+    install.packages('microeco', dependencies = TRUE)"
+
+# Bioconductor: Biostrings and DECIPHER
 RUN R --no-save --no-restore -e "\
     if (!requireNamespace('BiocManager', quietly = TRUE)) \
         install.packages('BiocManager', repos = 'https://cloud.r-project.org'); \
     BiocManager::install(c('Biostrings','DECIPHER'), ask = FALSE, update = FALSE)"
 
-# Verify all packages and binaries
+# Verify — prints which packages are missing before failing
 RUN R --no-save --no-restore -e "\
     pkgs <- c('tidyverse','Biostrings','DECIPHER','vegan','changepoint','magick','here', \
               'data.table','irr','ape','igraph','microeco'); \
-    missing <- pkgs[!sapply(pkgs, requireNamespace, quietly = TRUE)]; \
-    if (length(missing) > 0) stop(paste('Missing:', paste(missing, collapse=', '))); \
-    message('All packages verified OK')"
+    status <- sapply(pkgs, requireNamespace, quietly = TRUE); \
+    cat('Package status:\n'); \
+    for (i in seq_along(pkgs)) cat(sprintf('  %-20s %s\n', pkgs[i], ifelse(status[i], 'OK', 'MISSING'))); \
+    missing <- pkgs[!status]; \
+    if (length(missing) > 0) stop(paste('Missing packages:', paste(missing, collapse=', ')))"
 
 RUN vsearch --version
 
