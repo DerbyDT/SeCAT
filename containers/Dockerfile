@@ -23,21 +23,14 @@ RUN VSEARCH_VERSION=2.23.0 && \
 RUN R --no-save --no-restore -e "\
     options(repos = c(CRAN = 'https://cloud.r-project.org')); \
     install.packages(c('ggplot2','dplyr','tidyr','readr','purrr','tibble', \
-                       'stringr','forcats','lubridate'), dependencies = TRUE)"
+                       'stringr','forcats','lubridate','tidyverse'), \
+                     dependencies = TRUE)"
 
 RUN R --no-save --no-restore -e "\
     options(repos = c(CRAN = 'https://cloud.r-project.org')); \
     install.packages(c('data.table','here','vegan','changepoint', \
-                       'patchwork','gridExtra','ggrepel','fs', \
-                       'scales','digest'), dependencies = TRUE)"
-
-RUN R --no-save --no-restore -e "\
-    options(repos = c(CRAN = 'https://cloud.r-project.org')); \
-    install.packages('magick', dependencies = TRUE)"
-
-RUN R --no-save --no-restore -e "\
-    options(repos = c(CRAN = 'https://cloud.r-project.org')); \
-    install.packages('tidyverse', dependencies = TRUE)"
+                       'magick','patchwork','gridExtra','ggrepel', \
+                       'fs','scales','digest'), dependencies = TRUE)"
 
 RUN R --no-save --no-restore -e "\
     if (!requireNamespace('BiocManager', quietly = TRUE)) \
@@ -45,7 +38,8 @@ RUN R --no-save --no-restore -e "\
     BiocManager::install(c('Biostrings','DECIPHER'), ask = FALSE, update = FALSE)"
 
 RUN R --no-save --no-restore -e "\
-    pkgs <- c('tidyverse','Biostrings','DECIPHER','vegan','changepoint','magick','here','data.table'); \
+    pkgs <- c('ggplot2','dplyr','tidyr','readr','Biostrings','DECIPHER', \
+              'vegan','changepoint','magick','here','data.table'); \
     missing <- pkgs[!sapply(pkgs, requireNamespace, quietly = TRUE)]; \
     if (length(missing) > 0) stop(paste('Missing:', paste(missing, collapse=', '))); \
     message('All packages verified OK')"
