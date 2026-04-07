@@ -1,73 +1,95 @@
 #!/usr/bin/env nextflow
 // ============================================================================
 // SeCAT: Sequence Consensus Amplicon Trimming
-// Nextflow DSL2 Main Workflow (v4.1)
-//
-// Converted from SGE/bash orchestration (secat_pipeline.sh V3.4).
-// v4.1 changes:
-//   - Updated 08_gen_report.R (eff_inner/outer colouring, dg_outside_cons logic)
-//   - Added VALIDATE process (validation_taxon_v2.R, multi-tier ecological QC)
-//   - Added jasmin SLURM profile for LOTUS2
+// Nextflow DSL2 Main Workflow (v4.0)
 //
 // USAGE:
-//   nextflow run main.nf -profile jasmin,singularity -params-file params.yaml
-//   nextflow run main.nf -profile slurm,singularity  --manifest secat_manifest.tsv
-//   nextflow run main.nf -profile sge,singularity    --manifest secat_manifest.tsv
-//   nextflow run main.nf -profile local              --manifest secat_manifest.tsv
+//   # Run full pipeline (stages 1-6):
+//   nextflow run main.nf -profile sge -params-file params.yaml
 //
-// RESUME after failure:
-//   nextflow run main.nf -profile jasmin,singularity -resume
+//   # Resume after failure:
+//   nextflow run main.nf -profile sge -params-file params.yaml -resume
 //
-// See nextflow.config and params.yaml for all configurable parameters.
+//   # Run stage 7 (trim + merge) after interactive study selection:
+//   nextflow run main.nf -profile sge -params-file params.yaml --entry STANDARDIZE -resume
+//
+// PIPELINE FLOW:
+//   STUDY_MAPPING (parallel x N studies)
+//       └─> COLLECT_MAPS
+//                ├─> PREPARE_SIMS
+//                │       ├─> RUN_SIMULATION (parallel x 1100 tasks, max 50 concurrent)
+//                │       └─> ANALYSE_REAL   (parallel x N studies)
+//                │                 └─> AGGREGATE (waits for all sim + real results)
+//                │                           ├─> GENERATE_VERDICTS
+//                │                           ├─> GENERATE_REPORT
+//                │                           └─> GENERATE_INDEX
+//                │
+//                └─> [Manual: Rscript R/11_select_studies.R]
+//                        └─> nextflow run main.nf --entry STANDARDIZE -resume
+//                                  ├─> TRIM_SEQUENCES
+//                                  └─> MERGE_DATASETS
 // ============================================================================
 
 nextflow.enable.dsl = 2
 
-include { STUDY_MAPPING       } from './modules/local/study_mapping'
-include { COLLECT_MAPS        } from './modules/local/collect_maps'
-include { PREPARE_SIMS        } from './modules/local/prepare_sims'
-include { RUN_SIMULATION      } from './modules/local/run_simulation'
-include { ANALYSE_REAL        } from './modules/local/analyse_real'
-include { AGGREGATE           } from './modules/local/aggregate'
-include { GENERATE_VERDICTS   } from './modules/local/generate_verdicts'
-include { GENERATE_REPORT     } from './modules/local/generate_report'
-include { GENERATE_INDEX      } from './modules/local/generate_index'
-include { TRIM_SEQUENCES      } from './modules/local/trim_sequences'
-include { MERGE_DATASETS      } from './modules/local/merge_datasets'
-include { VALIDATE            } from './modules/local/validate'
-include { PRIMER_MAPPING      } from './modules/local/primer_mapping'
-include { GENERATE_PRIMER_DBS } from './modules/local/primer_mapping'
+// ----------------------------------------------------------------------------
+// Import process modules
+// ----------------------------------------------------------------------------
+include { STUDY_MAPPING     } from './modules/local/study_mapping'
+include { COLLECT_MAPS      } from './modules/local/collect_maps'
+include { PREPARE_SIMS      } from './modules/local/prepare_sims'
+include { RUN_SIMULATION    } from './modules/local/run_simulation'
+include { ANALYSE_REAL      } from './modules/local/analyse_real'
+include { AGGREGATE         } from './modules/local/aggregate'
+include { GENERATE_VERDICTS } from './modules/local/generate_verdicts'
+include { GENERATE_REPORT   } from './modules/local/generate_report'
+include { GENERATE_INDEX    } from './modules/local/generate_index'
+include { TRIM_SEQUENCES    } from './modules/local/trim_sequences'
+include { MERGE_DATASETS    } from './modules/local/merge_datasets'
+
+// ============================================================================
+// MAIN WORKFLOW — Stages 1 through 6 (+ optional Stage 7 via auto_trim)
+// ============================================================================
 
 workflow {
 
+    // -------------------------------------------------------------------------
+    // Input validation
+    // -------------------------------------------------------------------------
     if (!params.manifest) {
-        error "ERROR: --manifest is required. E.g. --manifest secat_manifest.tsv"
+        error "ERROR: --manifest is required. Set it in params.yaml or pass --manifest secat_manifest.tsv"
     }
     if (!params.reference_db) {
-        error "ERROR: --reference_db is required. Provide path to SILVA aligned FASTA."
+        error "ERROR: --reference_db is required. Set it in params.yaml or pass --reference_db /path/to/SILVA.fasta"
     }
 
     log.info """
     ============================================================
-      SeCAT v4.1 (Nextflow)
+      SeCAT v4.0 (Nextflow)
     ============================================================
       Manifest        : ${params.manifest}
       Reference DB    : ${params.reference_db}
-      Analysis mode   : ${params.analysis_mode}
       Simulations/set : ${params.num_simulations}
       Trim step mode  : ${params.trim_step_mode}
-      Run validation  : ${params.run_validation}
       Executor        : ${workflow.profile}
       Work dir        : ${workflow.workDir}
       Output dir      : ${params.outdir}
     ============================================================
     """.stripIndent()
 
+    // -------------------------------------------------------------------------
+    // Build manifest channel
+    // Produces one element per study row: tuple(study_name, row_map)
+    // -------------------------------------------------------------------------
     manifest_ch = Channel
         .fromPath(params.manifest, checkIfExists: true)
         .splitCsv(header: true, sep: '\t')
         .map { row -> tuple(row.study_name, row) }
 
+    // Enumerate studies (1-based index) for R scripts that use SGE_TASK_ID.
+    // .collect() gathers all rows first, then flatMap re-emits them with an
+    // index — guaranteeing stable 1-based numbering regardless of emit order.
+    // Produces: tuple(task_id, study_name, row_map)
     indexed_studies_ch = manifest_ch
         .collect()
         .flatMap { rows ->
@@ -76,47 +98,69 @@ workflow {
             }
         }
 
-    if (params.analysis_mode == 'study') {
-
-        STUDY_MAPPING(
-            indexed_studies_ch,
-            file(params.reference_db)
-        )
-
-        all_mapping_parts_ch = STUDY_MAPPING.out.mapping_part.collect()
-        COLLECT_MAPS(all_mapping_parts_ch)
-
-        collected_coords = COLLECT_MAPS.out.study_coords
-        collected_maps   = COLLECT_MAPS.out.collected_maps
-
-    } else if (params.analysis_mode == 'primer') {
-
-        PRIMER_MAPPING(file(params.reference_db))
-
-        primer_coords_ch = PRIMER_MAPPING.out.primer_coords
-            .splitCsv(header: true)
-            .map { row -> tuple(row.primer_name, file(params.reference_db)) }
-
-        GENERATE_PRIMER_DBS(primer_coords_ch)
-
-        collected_coords = PRIMER_MAPPING.out.primer_coords
-        collected_maps   = PRIMER_MAPPING.out.primer_coords
-
-    } else {
-        error "ERROR: analysis_mode must be 'study' or 'primer', got: ${params.analysis_mode}"
-    }
-
-    PREPARE_SIMS(
-        collected_coords,
+    // -------------------------------------------------------------------------
+    // Stage 2: Study mapping — parallel, one task per study
+    // Aligns each study's ASVs to SILVA via DECIPHER, produces:
+    //   - mapping_part_N.csv           (collected by COLLECT_MAPS)
+    //   - {study}_coords.csv           (per-ASV coordinates)
+    //   - {study}_aligned.fasta        (aligned sequences, needed by TRIM_SEQUENCES)
+    // -------------------------------------------------------------------------
+    STUDY_MAPPING(
+        indexed_studies_ch,
         file(params.reference_db)
     )
 
+    // -------------------------------------------------------------------------
+    // Collect all mapping parts before proceeding.
+    // .collect() waits for every STUDY_MAPPING task to finish — equivalent to
+    // the old SGE -hold_jid on the study mapping array job.
+    // COLLECT_MAPS aggregates the per-study CSV parts into study_alignment_coords.csv
+    // -------------------------------------------------------------------------
+    COLLECT_MAPS(
+        STUDY_MAPPING.out.mapping_part.collect()
+    )
+
+    // -------------------------------------------------------------------------
+    // Collect aligned FASTAs from STUDY_MAPPING output channel.
+    // Storing them here as a channel value means Nextflow tracks them as
+    // explicit named inputs to TRIM_SEQUENCES rather than relying on
+    // publishDir filesystem paths (which can fail with symlinks on some clusters).
+    // -------------------------------------------------------------------------
+    aligned_fastas_ch = STUDY_MAPPING.out.aligned_fasta.collect()
+
+    // -------------------------------------------------------------------------
+    // Stage 3: Prepare simulation tasks
+    // Reads study coords, samples SILVA reference subset, writes:
+    //   - simulation_tasks.csv              (N studies x num_simulations rows)
+    //   - simulation_reference_subset.fasta (10k SILVA sequences for simulations)
+    //   - consensusregioninfo.csv           (global consensus region boundaries)
+    // -------------------------------------------------------------------------
+    PREPARE_SIMS(
+        COLLECT_MAPS.out.study_coords,
+        file(params.reference_db)
+    )
+
+    // -------------------------------------------------------------------------
+    // Stage 4: Real data analysis — parallel, one task per study
+    // Runs concurrently with Stage 5 (both depend only on PREPARE_SIMS output).
+    // Produces {study_name}_results.rds per study.
+    // -------------------------------------------------------------------------
     ANALYSE_REAL(
         indexed_studies_ch,
-        collected_coords,
+        COLLECT_MAPS.out.study_coords,
         PREPARE_SIMS.out.consensus_info
     )
 
+    // -------------------------------------------------------------------------
+    // Stage 5: Simulation workers — fan-out from task channel
+    //
+    // splitCsv() converts simulation_tasks.csv (1100 rows) into a channel
+    // emitting one tuple per row. Each tuple becomes one RUN_SIMULATION task,
+    // running in parallel automatically — no array job submission needed.
+    //
+    // maxForks = 50 in nextflow.config throttles concurrency, equivalent to
+    // the old SGE -tc 50 flag on the simulation worker array.
+    // -------------------------------------------------------------------------
     sim_tasks_ch = PREPARE_SIMS.out.sim_tasks_csv
         .splitCsv(header: true)
         .map { row ->
@@ -126,21 +170,31 @@ workflow {
     RUN_SIMULATION(
         sim_tasks_ch,
         PREPARE_SIMS.out.sim_reference_subset,
-        collected_coords,
+        COLLECT_MAPS.out.study_coords,
         PREPARE_SIMS.out.consensus_info
     )
 
-    all_real_results_ch = ANALYSE_REAL.out.results_rds.collect()
-    all_sim_results_ch  = RUN_SIMULATION.out.results_rds.collect()
-
+    // -------------------------------------------------------------------------
+    // Stage 6: Aggregation
+    //
+    // .collect() on both output channels waits for ALL real data analyses and
+    // ALL simulation tasks to complete before AGGREGATE runs — equivalent to
+    // the old: qsub -hold_jid "$REAL_DATA_JOB_ID,$SIM_JOB_ID" 07_aggregate.sge
+    // -------------------------------------------------------------------------
     AGGREGATE(
-        all_real_results_ch,
-        all_sim_results_ch,
-        collected_coords,
+        ANALYSE_REAL.out.results_rds.collect(),
+        RUN_SIMULATION.out.results_rds.collect(),
+        COLLECT_MAPS.out.study_coords,
         PREPARE_SIMS.out.consensus_info
     )
 
-    GENERATE_VERDICTS(AGGREGATE.out.master_verdict_table)
+    // -------------------------------------------------------------------------
+    // Stage 6b: Verdicts, reports, and HTML index
+    // All three run in parallel once AGGREGATE finishes — independent of each other.
+    // -------------------------------------------------------------------------
+    GENERATE_VERDICTS(
+        AGGREGATE.out.master_verdict_table
+    )
 
     GENERATE_REPORT(
         AGGREGATE.out.aggregated_dir,
@@ -152,50 +206,101 @@ workflow {
         GENERATE_VERDICTS.out.verdict_data
     )
 
+    // -------------------------------------------------------------------------
+    // Stage 7 — two paths:
+    //
+    // DEFAULT (auto_trim = false):
+    //   Pipeline stops here. User reviews verdicts, runs 11_select_studies.R
+    //   interactively, then re-launches with --entry STANDARDIZE.
+    //
+    // auto_trim = true:
+    //   Skips human review and immediately trims all KEEP-verdict studies.
+    //   Only appropriate if you have already validated the verdict logic and
+    //   do not need to manually exclude any borderline studies.
+    // -------------------------------------------------------------------------
     if (params.auto_trim) {
-        log.warn "auto_trim=true: Trimming with KEEP-only verdicts. " +
-                 "Review output/aggregated_data/verdict_data_all_levels.csv first."
+
+        log.warn "auto_trim = true: proceeding without human review of verdicts. " +
+                 "Check ${params.outdir}/aggregated_data/verdict_data_all_levels.csv first."
+
         TRIM_SEQUENCES(
             GENERATE_VERDICTS.out.verdict_data,
             COLLECT_MAPS.out.study_coords,
             PREPARE_SIMS.out.consensus_info,
-            manifest_ch.collect()
+            manifest_ch.collect(),
+            aligned_fastas_ch
         )
+
         MERGE_DATASETS(
             TRIM_SEQUENCES.out.standardized_fastas.collect(),
             TRIM_SEQUENCES.out.trim_summary,
             manifest_ch.collect()
         )
-        if (params.run_validation) {
-            VALIDATE(
-                MERGE_DATASETS.out.combined_fasta,
-                MERGE_DATASETS.out.combined_otu,
-                MERGE_DATASETS.out.combined_tax,
-                MERGE_DATASETS.out.combined_meta.ifEmpty(file('NO_META')),
-                MERGE_DATASETS.out.asv_mapping.ifEmpty(file('NO_MAPPING')),
-                AGGREGATE.out.aggregated_dir
-            )
-        }
+
     } else {
-        log.info """
-        ============================================================
-        Pipeline complete. Review verdicts then run:
-          Rscript R/11_select_studies.R
-          nextflow run main.nf --entry STANDARDIZE -resume
-        ============================================================
-        """.stripIndent()
+
+        // Emit next-steps guidance to the Nextflow log when the verdict file lands
+        GENERATE_VERDICTS.out.verdict_data.view { f ->
+            """
+            ============================================================
+            SeCAT pipeline complete (Stages 1-6).
+
+            Verdicts written to:
+              ${params.outdir}/aggregated_data/verdict_data_all_levels.csv
+
+            NEXT STEPS:
+              1. Review reports:
+                   ${params.outdir}/reports/
+
+              2. Run interactive study selector (on login node):
+                   Rscript R/11_select_studies.R
+
+              3. Submit trim + merge:
+                   nextflow run main.nf \\
+                     -profile ${workflow.profile} \\
+                     -params-file params.yaml \\
+                     --entry STANDARDIZE \\
+                     -resume
+            ============================================================
+            """.stripIndent()
+        }
     }
 }
 
+// ============================================================================
+// STANDARDIZE entry point — Stage 7
+//
+// Run this after Rscript R/11_select_studies.R has written:
+//   output/aggregated_data/selected_studies_for_trim.txt
+//
+// USAGE:
+//   nextflow run main.nf \
+//     --entry STANDARDIZE \
+//     -profile sge \
+//     -params-file params.yaml \
+//     -resume
+//
+// -resume is important: it means Nextflow reads aligned FASTAs from the
+// cached STUDY_MAPPING outputs rather than re-running alignment.
+// ============================================================================
+
 workflow STANDARDIZE {
 
+    // Verify required files from the main pipeline run exist before proceeding
     selected_file  = file("${params.outdir}/aggregated_data/selected_studies_for_trim.txt",
                           checkIfExists: true)
     consensus_info = file("${params.outdir}/intermediate/consensusregioninfo.csv",
                           checkIfExists: true)
     study_coords   = file("${params.outdir}/intermediate/study_alignment_coords.csv",
                           checkIfExists: true)
-    aggregated_dir = file("${params.outdir}/aggregated_data", checkIfExists: true)
+
+    // Collect aligned FASTAs from the published output directory.
+    // Written by STUDY_MAPPING during the main workflow run.
+    // checkIfExists: true gives a clear error if study mapping never completed.
+    aligned_fastas_ch = Channel
+        .fromPath("${params.outdir}/intermediate/aligned_fastas/*_aligned.fasta",
+                  checkIfExists: true)
+        .collect()
 
     manifest_ch = Channel
         .fromPath(params.manifest, checkIfExists: true)
@@ -206,7 +311,8 @@ workflow STANDARDIZE {
         selected_file,
         study_coords,
         consensus_info,
-        manifest_ch.collect()
+        manifest_ch.collect(),
+        aligned_fastas_ch
     )
 
     MERGE_DATASETS(
@@ -214,15 +320,4 @@ workflow STANDARDIZE {
         TRIM_SEQUENCES.out.trim_summary,
         manifest_ch.collect()
     )
-
-    if (params.run_validation) {
-        VALIDATE(
-            MERGE_DATASETS.out.combined_fasta,
-            MERGE_DATASETS.out.combined_otu,
-            MERGE_DATASETS.out.combined_tax,
-            MERGE_DATASETS.out.combined_meta.ifEmpty(file('NO_META')),
-            MERGE_DATASETS.out.asv_mapping.ifEmpty(file('NO_MAPPING')),
-            aggregated_dir
-        )
-    }
 }
