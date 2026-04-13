@@ -17,6 +17,7 @@ process PRIMER_MAPPING {
     export SECAT_MAX_PRIMER_MISMATCH="${params.max_primer_mismatch}"
     export SECAT_OUTDIR="."
     mkdir -p output/intermediate
+    export SECAT_PROJECTDIR="${projectDir}"
     Rscript ${projectDir}/R/01_primer_mapping.R
     cp output/intermediate/primer_coords_phase1_output.csv ./primer_coords_phase1_output.csv
     """
@@ -40,6 +41,7 @@ process GENERATE_PRIMER_DBS {
     mkdir -p output/intermediate output/primer_databases
     cp ${params.outdir}/intermediate/primer_coords_phase1_output.csv \
        output/intermediate/primer_coords_phase1_output.csv
+    export SECAT_PROJECTDIR="${projectDir}"
     Rscript ${projectDir}/R/00_generate_primers.R "${primer_name}"
     cp output/primer_databases/db_${primer_name}.fasta ./db_${primer_name}.fasta
     """

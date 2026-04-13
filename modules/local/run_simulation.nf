@@ -10,7 +10,7 @@ process RUN_SIMULATION {
     path consensus_info
 
     output:
-    path "results.rds", emit: results_rds
+    path "${task_id}__seed_${seed}__results.rds", emit: results_rds
 
     script:
     """
@@ -34,13 +34,15 @@ process RUN_SIMULATION {
     export SECAT_SIM_ERROR_POSITION_BIAS="${params.sim_error_position_bias}"
     export SECAT_SIM_ADD_CHIMERAS="${params.sim_add_chimeras}"
     export SECAT_SIM_CHIMERA_RATE="${params.sim_chimera_rate}"
-    export SECAT_OUTDIR="${params.outdir}"
-    mkdir -p output/intermediate
-    cp ${study_coords}   output/intermediate/study_alignment_coords.csv 2>/dev/null || true
-    cp ${consensus_info} output/intermediate/consensusregioninfo.csv    2>/dev/null || true
-    echo "task_id,num_steps,amplicon_length,simulation_seed" > output/intermediate/simulation_tasks.csv
-    echo "${task_id},${num_steps},${amplicon_length},${seed}" >> output/intermediate/simulation_tasks.csv
+    export SECAT_OUTDIR="."
+    mkdir -p intermediate
+    cp ${sim_reference_subset} intermediate/simulation_reference_subset.fasta 2>/dev/null || true
+    cp ${study_coords}   intermediate/study_alignment_coords.csv 2>/dev/null || true
+    cp ${consensus_info} intermediate/consensusregioninfo.csv    2>/dev/null || true
+    echo "task_id,num_steps,amplicon_length,simulation_seed" > intermediate/simulation_tasks.csv
+    echo "${task_id},${num_steps},${amplicon_length},${seed}" >> intermediate/simulation_tasks.csv
+    export SECAT_PROJECTDIR="${projectDir}"
     Rscript ${projectDir}/R/05_sim_worker.R "${task_id}" "${seed}"
-    mv output/simulation_results/${task_id}/seed_${seed}/results.rds ./results.rds
+    mv simulation_results/${task_id}/seed_${seed}/results.rds ./${task_id}__seed_${seed}__results.rds 2>/dev/null || true
     """
 }

@@ -22,6 +22,7 @@ process GENERATE_REPORT {
     export SECAT_PLOT_DPI="${params.plot_dpi}"
     export SECAT_FORCE_REGENERATE="${params.force_regenerate}"
     export SECAT_OUTDIR="."
+    export SECAT_PROJECTDIR="${projectDir}"
     Rscript ${projectDir}/R/08_gen_report.R
     cp output/reports/*.pdf ./ 2>/dev/null || true
     cp -r output/final_plots ./ 2>/dev/null || true

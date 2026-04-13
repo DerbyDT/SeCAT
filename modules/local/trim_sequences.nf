@@ -26,6 +26,7 @@ process TRIM_SEQUENCES {
     export SECAT_ANALYSIS_MODE="${params.analysis_mode}"
     export SECAT_MIN_CONSENSUS_COVERAGE="${params.min_consensus_coverage}"
     export SECAT_OUTDIR="."
+    export SECAT_PROJECTDIR="${projectDir}"
     Rscript ${projectDir}/R/12_trim_sequences.R
     cp output/standardized_datasets/*_standardized.fasta ./ 2>/dev/null || true
     cp output/aggregated_data/trim_summary.csv           ./ 2>/dev/null || true

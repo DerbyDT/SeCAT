@@ -40,6 +40,7 @@ process VALIDATE {
 
     export SECAT_OUTDIR="."
 
+    export SECAT_PROJECTDIR="${projectDir}"
     Rscript ${projectDir}/R/validation_taxon_v2.R \
         0 \
         FALSE \

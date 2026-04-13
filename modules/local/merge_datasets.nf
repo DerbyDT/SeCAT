@@ -27,6 +27,7 @@ process MERGE_DATASETS {
     export SECAT_MERGE_METHOD="${params.merge_method}"
     export SECAT_HARMONIZE_METADATA="${params.harmonize_metadata}"
     export SECAT_OUTDIR="."
+    export SECAT_PROJECTDIR="${projectDir}"
     Rscript ${projectDir}/R/13_merge_datasets.R
     cp output/meta_analysis/combined_sequences.fasta      ./ 2>/dev/null || true
     cp output/meta_analysis/combined_feature_table.tsv    ./ 2>/dev/null || true

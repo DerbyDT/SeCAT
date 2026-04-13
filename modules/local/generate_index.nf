@@ -18,6 +18,7 @@ process GENERATE_INDEX {
     export SECAT_MANIFEST="${params.manifest}"
     export SECAT_ANALYSIS_MODE="${params.analysis_mode}"
     export SECAT_OUTDIR="."
+    export SECAT_PROJECTDIR="${projectDir}"
     Rscript ${projectDir}/R/09_gen_index.R
     cp output/reports/*.html ./ 2>/dev/null || true
     """

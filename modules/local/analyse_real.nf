@@ -1,12 +1,13 @@
 process ANALYSE_REAL {
     tag "${study_name}"
-    label 'mem_30g'
+    label 'mem_64g'
     publishDir "${params.outdir}/real_data_results/${study_name}", mode: 'copy', pattern: "*_results.rds"
 
     input:
     tuple val(task_id), val(study_name), val(manifest_row)
     path study_coords
     path consensus_info
+    path clean_manifest
 
     output:
     path "${study_name}_results.rds", emit: results_rds
@@ -14,7 +15,7 @@ process ANALYSE_REAL {
     script:
     """
     export SGE_TASK_ID=${task_id}
-    export SECAT_MANIFEST="${params.manifest}"
+    export SECAT_MANIFEST="\$(realpath ${clean_manifest})"
     export SECAT_ANALYSIS_MODE="${params.analysis_mode}"
     export SECAT_VSEARCH_PATH="vsearch"  # binary is on PATH inside container
     export SECAT_TRIM_STEP_MODE="${params.trim_step_mode}"
@@ -32,10 +33,11 @@ process ANALYSE_REAL {
     export SECAT_NULL_MODEL_MIN_TRIM_BP="${params.null_model_min_trim_bp}"
     export SECAT_DISTANCE_CUTOFF="${params.distance_cutoff_threshold}"
     export SECAT_DISTANCE_CUTOFF_MIN_BP="${params.distance_cutoff_min_trim_bp}"
-    export SECAT_OUTDIR="${params.outdir}"
-    mkdir -p output/intermediate
+    export SECAT_OUTDIR="."
+    mkdir -p output/intermediate output/real_data_results/${study_name}
     cp ${study_coords}   output/intermediate/study_alignment_coords.csv 2>/dev/null || true
     cp ${consensus_info} output/intermediate/consensusregioninfo.csv    2>/dev/null || true
+    export SECAT_PROJECTDIR="${projectDir}"
     Rscript ${projectDir}/R/06_analyse_real.R
     mv output/real_data_results/${study_name}/${study_name}_results.rds ./${study_name}_results.rds
     """

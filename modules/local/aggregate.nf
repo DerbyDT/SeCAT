@@ -21,16 +21,18 @@ process AGGREGATE {
     mkdir -p output/intermediate output/real_data_results output/simulation_results aggregated_data
     cp ${study_coords}   output/intermediate/study_alignment_coords.csv 2>/dev/null || true
     cp ${consensus_info} output/intermediate/consensusregioninfo.csv    2>/dev/null || true
-    for f in ${real_results}; do
+    for f in *_results.rds; do
+        [[ "\$f" == *__seed_* ]] && continue
         study=\$(basename \$f _results.rds)
         mkdir -p output/real_data_results/\${study}
         cp \$f output/real_data_results/\${study}/\${study}_results.rds
     done
-    idx=1
-    for f in ${sim_results}; do
-        mkdir -p output/simulation_results/sim_task_\${idx}/seed_0
-        cp \$f output/simulation_results/sim_task_\${idx}/seed_0/results.rds
-        idx=\$((idx + 1))
+    for f in *__seed_*__results.rds; do
+        fname=\$(basename \$f)
+        task_id=\$(echo \$fname | sed 's/__seed_.*//')
+        seed=\$(echo \$fname | sed 's/.*__seed_//' | sed 's/__results.rds//')
+        mkdir -p output/simulation_results/\${task_id}/seed_\${seed}
+        cp \$f output/simulation_results/\${task_id}/seed_\${seed}/results.rds
     done
     export SECAT_MANIFEST="${params.manifest}"
     export SECAT_ANALYSIS_MODE="${params.analysis_mode}"
@@ -41,7 +43,8 @@ process AGGREGATE {
     export SECAT_DISTANCE_CUTOFF="${params.distance_cutoff_threshold}"
     export SECAT_CONSENSUS_OPT_THRESHOLD="${params.consensus_optimization_threshold}"
     export SECAT_MIN_CONSENSUS_STUDIES="${params.min_consensus_studies}"
-    export SECAT_OUTDIR="."
+    export SECAT_OUTDIR="./output"
+    export SECAT_PROJECTDIR="${projectDir}"
     Rscript ${projectDir}/R/07_aggregate.R
     cp output/aggregated_data/* aggregated_data/ 2>/dev/null || true
     """

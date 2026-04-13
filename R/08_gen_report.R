@@ -21,7 +21,13 @@
 
 message("--- Loading libraries and configuration ---")
 suppressPackageStartupMessages({
-    library(tidyverse)
+    suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(tidyr))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(readr))
+suppressPackageStartupMessages(library(stringr))
+suppressPackageStartupMessages(library(purrr))
+suppressPackageStartupMessages(library(tibble))
     library(here)
     library(patchwork)   # For combining plots (plot_layout)
     library(ggrepel)     # For non-overlapping text labels
@@ -52,16 +58,16 @@ PLOT_HEIGHT <- if (exists("PLOT_HEIGHT")) PLOT_HEIGHT else 11
 PLOT_DPI <- if (exists("PLOT_DPI")) PLOT_DPI else 300
 
 # Load project configuration
-if (file.exists(here::here("R"))) {
-    source(here::here("secat_config.R"))
+if (file.exists(file.path(Sys.getenv("SECAT_PROJECTDIR", getwd()), "R"))) {
+    source(file.path(Sys.getenv("SECAT_PROJECTDIR", getwd()), "R/secat_config.R"))
 } else {
     # Fallback paths if not running from root
-    AGGREGATED_DATA_DIR <- here::here("output", "aggregated_data")
-    SECAT_MANIFEST_PATH <- here::here("secat_manifest.tsv")
-    FINAL_PLOTS_DIR <- here::here("output", "final_plots")
+    AGGREGATED_DATA_DIR <- file.path(OUTDIR, "aggregated_data")
+    SECAT_MANIFEST_PATH <- SECAT_MANIFEST_PATH
+    FINAL_PLOTS_DIR <- file.path(OUTDIR, "final_plots")
 }
 
-output_dir <- if (exists("FINAL_PLOTS_DIR")) FINAL_PLOTS_DIR else here::here("output", "final_plots")
+output_dir <- if (exists("FINAL_PLOTS_DIR")) FINAL_PLOTS_DIR else file.path(OUTDIR, "final_plots")
 if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
 
 # ==============================================================================
@@ -168,7 +174,7 @@ message(paste("   → Loaded", nrow(master_verdicts), "verdict records for",
               length(unique(master_verdicts$Study)), "studies"))
 
 # --- 2e. Load Manifest ---
-master_manifest <- read_tsv(here::here(SECAT_MANIFEST_PATH), show_col_types = FALSE)
+master_manifest <- read_tsv(SECAT_MANIFEST_PATH, show_col_types = FALSE)
 master_manifest$study_name <- trimws(master_manifest$study_name)
 
 # Clean up memory after large loads
@@ -1166,7 +1172,7 @@ Is_Warning_Only = !is.na(Consensus_Status) & Consensus_Status == "WARNING_SINGLE
     message(paste("   -> Plotting", nrow(amplicon_data), "studies"))
 
     # --- 3. CONSENSUS REGION LOADING FROM FILE (NEW LOGIC) ---
-    consensus_file <- here::here("output/intermediate/consensusregioninfo.csv")
+    consensus_file <- file.path(OUTDIR, "intermediate/consensusregioninfo.csv")
     outlier_studies <- character(0)
     consensus_start <- NA
     consensus_end <- NA
@@ -1192,7 +1198,7 @@ Is_Warning_Only = !is.na(Consensus_Status) & Consensus_Status == "WARNING_SINGLE
     # Fallback: Recalculate if file doesn't exist or is invalid
     if (is.na(consensus_start) || is.na(consensus_end) || consensus_start >= consensus_end) {
         message("   [WARN] No valid consensus file found. Recalculating from scratch...")
-        source(here::here("R/secat_consensus.R"))
+        source(file.path(Sys.getenv("SECAT_PROJECTDIR", getwd()), "R/secat_consensus.R"))
         
         consres <- find_largest_overlapping_clique(
             starts = amplicon_data$Amplicon_Start,
@@ -1495,7 +1501,7 @@ create_practical_guide <- function() {
         # Try to load study data
         study_file_pattern <- paste0("*", study_name, "*results.rds")
         study_files <- list.files(
-            path = here::here("output", "real_data_results"),
+            path = file.path(OUTDIR, "real_data_results"),
             pattern = study_file_pattern,
             recursive = TRUE,
             full.names = TRUE
@@ -1812,7 +1818,7 @@ check_report_exists <- function(study_name, primer) {
 
 message("--- Processing studies with file existence checks ---")
 
-real_data_files <- list.files(path = here("output", "real_data_results"),
+real_data_files <- list.files(path = file.path(OUTDIR, "real_data_results"),
                              pattern = "_results\\.rds$",
                              recursive = TRUE,
                              full.names = TRUE)
