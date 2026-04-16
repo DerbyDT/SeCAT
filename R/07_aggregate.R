@@ -817,14 +817,23 @@ combine_csv_streaming <- function(pattern, output_filename, search_dir) {
 main <- function() {
   log_and_flush("--- SCRIPT STARTED: Loading libraries ---")
   suppressPackageStartupMessages({
-    library(tidyverse); library(fs); library(here); library(changepoint); library(vegan)
+    suppressPackageStartupMessages(library(dplyr))
+    suppressPackageStartupMessages(library(tidyr))
+    suppressPackageStartupMessages(library(ggplot2))
+    suppressPackageStartupMessages(library(readr))
+    suppressPackageStartupMessages(library(stringr))
+    suppressPackageStartupMessages(library(purrr))
+    suppressPackageStartupMessages(library(tibble))
+    suppressPackageStartupMessages(library(here))
+    suppressPackageStartupMessages(library(changepoint))
+    suppressPackageStartupMessages(library(vegan))
   })
 
   log_and_flush("--- Sourcing configuration and utilities ---")
-  source(here::here("secat_config.R"))
-  source(here::here("R/secat_utils.R"))
+  source(file.path(Sys.getenv("SECAT_PROJECTDIR", getwd()), "R/secat_config.R"))
+  source(file.path(Sys.getenv("SECAT_PROJECTDIR", getwd()), "R/secat_utils.R"))
 
-  BASE_OUTPUT_DIR <- here::here("output")
+  BASE_OUTPUT_DIR <- file.path(OUTDIR)
   AGGREGATED_DATA_DIR <- file.path(BASE_OUTPUT_DIR, "aggregated_data")
   REAL_DATA_RESULTS_DIR <- file.path(BASE_OUTPUT_DIR, "real_data_results")
   SIMULATION_RESULTS_DIR <- file.path(BASE_OUTPUT_DIR, "simulation_results")
@@ -886,7 +895,7 @@ main <- function() {
   log_and_flush("--- Starting Main Processing Loop (One Study at a Time) ---")
 
   # Load outlier list once at the start
-  consensus_file <- here::here("output/intermediate/consensusregioninfo.csv")
+  consensus_file <- file.path(OUTDIR, "intermediate/consensusregioninfo.csv")
   outlier_studies <- character(0)
 
   if (file.exists(consensus_file)) {
@@ -917,7 +926,7 @@ main <- function() {
 
     log_and_flush("  -> Generating verdicts...")
     target_trim <- current_study_data$target_trim_bp
-    real_curve <- current_study_data$dissim_data %>% filter(mode == "both") %>% arrange(Trim_BP) %>% mutate(Trim_Step = dense_rank(Trim_BP) - 1)
+    real_curve <- current_study_data$dissim_data %>% arrange(Trim_BP) %>% mutate(Trim_Step = dense_rank(Trim_BP) - 1)
     sim_baseline_for_task <- sim_data_for_task %>% dplyr::filter(Trim_BP == 0)
 
     # --- OUTLIER LOGIC: Check once per study, before level loop ---
@@ -985,7 +994,7 @@ main <- function() {
                       pretrim_dissim[1] > bc_ceiling
 
       primer_name_for_verdict <- if(ANALYSIS_MODE == "primer") task_id_for_sims else {
-        coords_file <- here::here("output/intermediate/study_alignment_coords.csv")
+        coords_file <- file.path(OUTDIR, "intermediate/study_alignment_coords.csv")
         if(file.exists(coords_file)) {
           coords_data <- read_csv(coords_file, show_col_types = FALSE)
           matched_coords <- coords_data %>% filter(study_name == !!study_name)
