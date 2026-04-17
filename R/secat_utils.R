@@ -1625,7 +1625,7 @@ calculate_taxonomic_retention <- function(otu_tables_per_level, num_steps, incre
     all_retention[[level]] <- tibble::tibble(
       Level = level,
       TrimStep = 1:num_steps,
-      TrimBP = (1:num_steps) * increment,
+      Trim_BP = (1:num_steps) * increment,
       Retention = retention_values,
       mode = "both"
     )
