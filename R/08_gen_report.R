@@ -1,24 +1,42 @@
 #!/usr/bin/env Rscript
 # ==============================================================================
-# SCRIPT:   scripts/08_gen_report.R
-# PIPELINE: SeCAT (Sequence Consensus Analysis Tool)
-# PHASE:    Phase 6: Final Report Generation
-# VERSION:  2.0 (Dynamic Step Calculation)
-# AUTHOR:   [Author Name]
+# SCRIPT:   08_gen_report.R
+# PIPELINE: SeCAT v4.1 (Sequence Consensus Amplicon Trimming)
+# STAGE:    Stage 8 — Per-Study Diagnostic Report Generation
+# PURPOSE:  Generate comprehensive PDF reports with degradation curves, null
+#           model comparisons, changepoint annotations, and verdict summaries.
 #
-# PURPOSE:
-#   This is the visualization engine of SeCAT. It takes the "Verdicts" from
-#   Phase 5 and the raw data from Phases 3 & 4 to generate:
-#   1. Individual PDF Reports for every study (Dissimilarity, Retention, Impact).
-#   2. A Master Summary PDF comparing all studies (Alignment Map, Forest Plot).
+# OVERVIEW:
+#   For each study in the aggregated results, this script produces a multi-page
+#   PDF diagnostic report containing:
+#   - Beta-diversity degradation curves (real vs simulated null distributions)
+#   - Changepoint detection results overlaid on degradation curves
+#   - Taxonomic retention plots across trim steps
+#   - Core taxa dynamics and impact analysis
+#   - Verdict summary (KEEP/EXCLUDE with supporting statistics)
+#   These reports enable manual review of trimming decisions before proceeding
+#   to the standardisation step.
 #
-# CHUNK 1: SETUP & DATA LOADING
-#   - Loads necessary plotting libraries (ggplot2, patchwork, magick).
-#   - Loads the aggregated simulation baselines (The "Gray Ribbon").
-#   - Loads the master verdict table (The "Decisions").
-#   - Defines shared helper functions for plotting thresholds.
+# INPUTS:
+#   - output/aggregated_data/ (aggregated results from 07_aggregate.R)
+#   - verdict_data_all_levels.csv (per-study verdicts)
+#   - Real data results RDS files
+#   - Study coordinates and consensus info
+#
+# OUTPUTS:
+#   - output/reports/<study_name>_report.pdf (one per study)
+#
+# DEPENDENCIES:
+#   - ggplot2: all visualisations
+#   - R/secat_config.R: global configuration
+#
+# CALLED BY:
+#   - modules/local/generate_report.nf (GENERATE_REPORT process)
 # ==============================================================================
 
+# --- Library Loading ---
+# Core tidyverse for data wrangling; plotting stack (ggplot2 + patchwork) for
+# multi-panel diagnostic figures; png/grid for rasterised PDF assembly.
 message("--- Loading libraries and configuration ---")
 suppressPackageStartupMessages({
     suppressPackageStartupMessages(library(dplyr))
@@ -39,8 +57,10 @@ suppressPackageStartupMessages(library(tibble))
     library(gtable)
 })
 
-# --- CRITICAL: Define log_and_flush function ---
-# Ensures logs appear in real-time in the SGE output file
+# --- log_and_flush ---
+# Purpose:  Timestamped logging with immediate buffer flush for SGE/HPC output.
+# Params:   message (character) — text to log.
+# Returns:  NULL (side-effect: writes to stdout).
 log_and_flush <- function(message) {
   cat(paste(Sys.time(), "|", message, "\n"))
   flush.console()
@@ -48,6 +68,9 @@ log_and_flush <- function(message) {
 
 # ==============================================================================
 # SECTION 1: CONFIGURATION
+# Plot dimensions, regeneration flags, and project paths.
+# These can be pre-set in the calling environment (e.g., Nextflow process) or
+# will fall back to sensible defaults for interactive use.
 # ==============================================================================
 
 # Load from config with defaults (allows running interactively or via script)
@@ -72,6 +95,12 @@ if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
 
 # ==============================================================================
 # SECTION 2: LOAD SHARED DATA
+# Loads four key datasets used across all reports:
+#   2a. Simulation baselines  — null-model dissimilarity ribbons
+#   2b. Simulation retention   — expected taxon loss under random trimming
+#   2c. Retention processing   — aggregates raw per-seed curves if needed
+#   2d. Master verdict table   — pass/fail decisions from 07_aggregate.R
+#   2e. Study manifest         — metadata linking study names to primers
 # ==============================================================================
 log_and_flush("--- Loading shared data ---")
 
@@ -182,23 +211,29 @@ gc()
 
 # ==============================================================================
 # SECTION 3: SHARED HELPER FUNCTIONS
+# Utility functions used by all four panel-plotting functions and the master
+# summary generators. These handle threshold extraction, verdict labelling,
+# and the visual overlay of threshold lines onto ggplot objects.
 # ==============================================================================
 
-# Function: is_valid_df
-# Description: Checks if an object is a non-empty data frame.
+# --- is_valid_df ---
+# Purpose:  Guard clause — checks if an object is a non-empty data.frame.
+# Params:   df — any R object.
+# Returns:  logical scalar.
 is_valid_df <- function(df) {
   !is.null(df) && inherits(df, "data.frame") && nrow(df) > 0
 }
 
-# Function: compute_first_threshold
-# Description: Extracts the correct degradation threshold for summary functions,
-#              using Confirmed_Threshold_BP when available (v3.2+) and falling back
-#              to min() for legacy verdict tables. Used by all four summary functions
-#              to replace the old inline pmap_dbl(min()) pattern.
-#
-#              For WARNING_SINGLE: returns NA (lone trigger, not confirmed).
-#              For CONFIRMED:      returns Confirmed_Threshold_BP.
-#              For NONE / legacy:  returns NA or min() respectively.
+# --- compute_first_threshold ---
+# Purpose:  Extract the confirmed degradation threshold for a single study-level
+#           row, abstracting over v3.2+ consensus columns and legacy tables.
+# Params:   cp, cut, null       — individual method thresholds (BP).
+#           confirmed_bp        — consensus-confirmed threshold (v3.2+).
+#           consensus_status    — "CONFIRMED", "WARNING_SINGLE", "NONE", etc.
+# Returns:  numeric scalar (BP) or NA_real_ if no confirmed degradation.
+# Logic:    WARNING_SINGLE -> NA (lone trigger, not corroborated).
+#           CONFIRMED/HARD_FAIL -> Confirmed_Threshold_BP.
+#           Legacy (no consensus columns) -> min() of non-NA individual methods.
 compute_first_threshold <- function(cp, cut, null, confirmed_bp = NA_real_, consensus_status = NA_character_) {
   # v3.2+ path
   if (!is.na(consensus_status)) {
@@ -211,10 +246,19 @@ compute_first_threshold <- function(cp, cut, null, confirmed_bp = NA_real_, cons
   if (length(thresholds) == 0) NA_real_ else min(thresholds)
 }
 
-# Function: add_threshold_lines
-# Description: Adds the visual "Goal Post" (Green) and "Failure Point" (Red) lines.
-#              Critically, it divides by 'increment' to plot correctly on the X-axis,
-#              which is usually in "Steps", not "BP".
+# --- add_threshold_lines ---
+# Purpose:  Overlay vertical reference lines on any ggplot panel:
+#             Green dashed  = minimum required trim (target).
+#             Red dotted    = confirmed multi-method degradation threshold.
+#             Orange dotted = single-method WARNING_SINGLE trigger.
+# Params:   p                  — ggplot object to annotate.
+#           required_thresh_bp — target trim length from consensus region (BP).
+#           observed_thresh_bp — confirmed degradation point (BP), or NA.
+#           increment          — BP per trim step (for x-axis conversion).
+#           warning_thresh_bp  — single-method warning point (BP), or NA.
+# Returns:  Modified ggplot object with geom_vline layers added.
+# Note:     X-axis is in trim-step units, so all BP values are divided by
+#           increment before plotting.
 add_threshold_lines <- function(p, required_thresh_bp, observed_thresh_bp,
                                 increment = NULL, warning_thresh_bp = NA_real_) {
   if (is.null(increment) || is.na(increment)) {
@@ -240,16 +284,18 @@ add_threshold_lines <- function(p, required_thresh_bp, observed_thresh_bp,
   return(p)
 }
 
-# Function: get_first_degradation_threshold
-# Description: Returns the CONFIRMED degradation threshold from consensus voting
-#              (v3.2+: uses Confirmed_Threshold_BP column from 07_aggregate.R).
-#
-#              Falls back to old min() behaviour only if the new columns are
-#              absent — this keeps the script compatible with older verdict tables.
-#
-#              For WARNING_SINGLE status (single method triggered, no consensus):
-#              returns NA so that NO red line is drawn. The warning is shown in
-#              the subtitle instead. This prevents false-positive red lines.
+# --- get_first_degradation_threshold ---
+# Purpose:  Return the confirmed degradation threshold (BP) for a single
+#           study x level combination. Used to decide whether to draw the
+#           red "failure point" line on individual study plots.
+# Params:   vdf — data.frame (typically 1 row) from master_verdicts, filtered
+#                 to a specific Study + Level.
+# Returns:  numeric scalar (BP) or NA_real_.
+# Behaviour by consensus status:
+#   CONFIRMED / HARD_FAIL  -> Confirmed_Threshold_BP (red line drawn).
+#   WARNING_SINGLE         -> NA (no red line; orange warning shown instead).
+#   NONE                   -> NA (study passes; no degradation detected).
+#   Legacy tables          -> min() of individual method thresholds.
 get_first_degradation_threshold <- function(vdf) {
   if (is.null(vdf) || nrow(vdf) == 0) return(NA_real_)
 
@@ -272,11 +318,12 @@ get_first_degradation_threshold <- function(vdf) {
   if (length(tt) == 0) NA_real_ else min(tt)
 }
 
-# Function: get_first_degradation_method
-# Description: Returns a human-readable label for what drove the detected threshold.
-#              For v3.2+ verdict tables, reads Consensus_Status and N_Methods_Agree
-#              to produce an informative label. Falls back to method-matching for
-#              legacy tables.
+# --- get_first_degradation_method ---
+# Purpose:  Return a human-readable label describing which detection method(s)
+#           drove the degradation threshold (used in plot subtitles).
+# Params:   vdf — data.frame (1 row) from master_verdicts for a Study + Level.
+# Returns:  character string, e.g. "Consensus (3 methods agree)",
+#           "Warning -- Changepoint only (1/5 methods)", or "No Degradation".
 get_first_degradation_method <- function(vdf) {
   if (is.null(vdf) || nrow(vdf) == 0) return("No Degradation")
 
@@ -329,15 +376,38 @@ get_first_degradation_method <- function(vdf) {
 }
 
 # ==============================================================================
-# SECTION 4: PLOTTING FUNCTIONS
+# SECTION 4: PLOTTING FUNCTIONS — INDIVIDUAL STUDY PANELS (A–D)
+#
+# Each study report page contains four panels at a given taxonomic level:
+#   Panel A: Dissimilarity curve — does beta-diversity increase with trimming?
+#   Panel B: Retention curve    — how many taxa survive each trim step?
+#   Panel C: Taxon impact       — which taxa change most in abundance?
+#   Panel D: Core taxa          — are high-prevalence taxa stable under trimming?
+#
+# All panels share the same x-axis (trim steps) and overlay threshold lines
+# from the verdict table (green = required, red = confirmed degradation,
+# orange = single-method warning).
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
-# Function: plot_dissimilarity_robust (Panel A)
-# Description: Plots the Community Dissimilarity (Beta Diversity) vs Trimming.
-#              - Red Line: Real Data behavior.
-#              - Blue Ribbon: Simulation Baseline (Null Model).
-#              - Dynamic Scaling: Zooms in if dissimilarity is low.
+# Panel A: plot_dissimilarity_robust
+# ------------------------------------------------------------------------------
+# Purpose:  Plot Bray-Curtis dissimilarity (beta-diversity) against trimming
+#           for real data (red line) overlaid on the null-model simulation
+#           envelope (blue ribbon = 95% CI). This is the primary diagnostic:
+#           if the red line rises above the blue ribbon, trimming is distorting
+#           community structure beyond what random sequence shortening would.
+#
+# Params:   study_data          — list with $dissim_data, $increment, etc.
+#           sim_baseline_df     — simulation baseline (Mean/CI) for this study.
+#           verdict_df          — verdict row(s) for threshold lines.
+#           max_step_bp         — max observed data extent (BP).
+#           taxonomic_level     — e.g. "Family", "Genus".
+#           observed_thresh_bp  — confirmed degradation threshold (BP) or NA.
+#           plot_max_step_index — optional override for x-axis limit (steps).
+#           warning_thresh_bp   — single-method warning point (BP) or NA.
+#
+# Returns:  ggplot object (single panel).
 # ------------------------------------------------------------------------------
 plot_dissimilarity_robust <- function(study_data,
                                       sim_baseline_df,
@@ -377,12 +447,14 @@ plot_dissimilarity_robust <- function(study_data,
 
   if (nrow(real_curve) == 0) return(ggplot() + labs(title = "A) Dissimilarity", subtitle = "No filtered data") + theme_bw())
 
-  # 5. Plot
+  # 5. Plot — red line = real data dissimilarity trajectory
   p <- ggplot(real_curve, aes(x = TrimStep, y = Dissimilarity)) +
     geom_line(color = "red", linewidth = 1) +
     theme_bw()
 
-  # 6. Simulation Baseline (WITH IMPUTATION)
+  # 6. Simulation Baseline overlay — blue ribbon shows the 95% CI envelope
+  #    from null-model simulations (random sequence trimming). If the red line
+  #    stays within this ribbon, trimming has no more effect than chance.
   max_y_sim <- 0
   if (is_valid_df(sim_baseline_df)) {
     sim_baseline_filtered <- sim_baseline_df %>%
@@ -402,7 +474,8 @@ plot_dissimilarity_robust <- function(study_data,
     }
   }
 
-  # 7. Scales & Labels
+  # 7. Scales & Labels — dynamic y-axis: cap at 1.0 (Bray-Curtis max) but
+  #    zoom in to at least 0.1 so low-dissimilarity studies show detail.
   global_max <- max(real_curve$Dissimilarity, max_y_sim, na.rm = TRUE)
   upper_limit <- min(1.0, max(0.1, global_max * 1.1))
 
@@ -429,9 +502,15 @@ plot_dissimilarity_robust <- function(study_data,
 }
 
 # ------------------------------------------------------------------------------
-# Function: plot_retention_robust (Panel B)
-# Description: Plots Taxon Retention (Alpha Diversity) vs Trimming.
-#              - Dynamic Scaling: If retention is high (>90%), zooms in the Y-axis.
+# Panel B: plot_retention_robust
+# ------------------------------------------------------------------------------
+# Purpose:  Plot percentage of taxa retained at each trim step. Complements
+#           Panel A by showing alpha-diversity loss. A study that maintains
+#           high retention (>90%) across all trim steps is robust to trimming.
+#           Dynamic y-axis: zooms to 80-100% when min retention > 90%.
+#
+# Params:   Same signature as plot_dissimilarity_robust (see Panel A).
+# Returns:  ggplot object (single panel).
 # ------------------------------------------------------------------------------
 plot_retention_robust <- function(study_data,
                                   retention_baseline,
@@ -494,7 +573,8 @@ plot_retention_robust <- function(study_data,
     }
   }
 
-  # 7. Dynamic Y-Axis
+  # 7. Dynamic Y-Axis — if retention never drops below 90%, zoom in to
+  #    80-100% range so small but ecologically meaningful losses are visible.
   min_retention_obs <- min(real_curve$Retention, na.rm = TRUE)
   y_min_limit <- if (min_retention_obs > 90) 80 else 0
 
@@ -517,10 +597,24 @@ plot_retention_robust <- function(study_data,
 }
 
 # ------------------------------------------------------------------------------
-# Function: plot_taxon_impact_combined (Panel C)
-# Description: Visualizes the specific taxa being affected.
-#              - Top: Line chart of the 10 most variable taxa.
-#              - Bottom: Bar chart of Top 5 Increased vs Top 5 Decreased taxa.
+# Panel C: plot_taxon_impact_combined
+# ------------------------------------------------------------------------------
+# Purpose:  Identify WHICH taxa are most affected by trimming. Two sub-panels:
+#     Top:  Faceted line chart of the 10 most variable taxa (by abundance
+#           range across trim steps) — shows trajectory of each taxon.
+#     Bottom: Diverging bar chart of top 5 increased + top 5 decreased taxa
+#           at the degradation threshold (or max trim if no degradation).
+#           This reveals whether trimming inflates opportunists or removes
+#           ecologically important taxa.
+#
+# Params:   study_data          — list with $taxon_impacts sub-list.
+#           verdict_df          — for threshold lines.
+#           taxonomic_level     — e.g. "Family".
+#           max_step_bp         — data extent (BP).
+#           observed_thresh_bp  — confirmed degradation (BP) or NA.
+#           plot_max_step_index — x-axis limit override (steps).
+#           warning_thresh_bp   — single-method warning (BP) or NA.
+# Returns:  Combined patchwork plot (line chart / bar chart stacked).
 # ------------------------------------------------------------------------------
 plot_taxon_impact_combined <- function(study_data,
                                        verdict_df,
@@ -597,9 +691,11 @@ plot_taxon_impact_combined <- function(study_data,
       }, error = function(e) {})
   }
 
-  # --- PLOT 2: Bar Chart ---
-  # For CONFIRMED degradation use confirmed threshold; for WARNING_SINGLE use the warning point;
-  # for PASS use max trim (shows full-range abundance change).
+  # --- PLOT 2: Diverging Bar Chart of Abundance Change ---
+  # Reference point selection: use the confirmed degradation threshold if available;
+  # for WARNING_SINGLE use the warning point; for PASS use max trim to show the
+  # full-range abundance shift. This ensures the bar chart always compares
+  # initial (0 bp) vs. a biologically meaningful endpoint.
   safe_threshold_bp <- if (!is.na(observed_thresh_bp)) {
     observed_thresh_bp
   } else if (!is.na(warning_thresh_bp)) {
@@ -656,9 +752,17 @@ plot_taxon_impact_combined <- function(study_data,
 }
 
 # ------------------------------------------------------------------------------
-# Function: plot_core_taxa_robust (Panel D)
-# Description: Plots the Core Taxa (High Prevalence, High Abundance).
-#              - Fallback: If no core taxa exist, shows the practical study inclusion guide.
+# Panel D: plot_core_taxa_robust
+# ------------------------------------------------------------------------------
+# Purpose:  Track the stability of core taxa (high prevalence + high abundance)
+#           across trim steps. Core taxa are ecologically dominant members of
+#           the community; if trimming destabilises them, the study's biological
+#           signal is compromised. Faceted by taxon, free y-scales.
+#           Fallback: if no core taxa data exists, displays a text-based
+#           quality assessment summary (create_study_specific_practical_guide).
+#
+# Params:   Same as plot_dissimilarity_robust minus sim_baseline_df.
+# Returns:  ggplot object (faceted line chart or text fallback panel).
 # ------------------------------------------------------------------------------
 plot_core_taxa_robust <- function(study_data,
                                   verdict_df,
@@ -748,8 +852,15 @@ plot_core_taxa_robust <- function(study_data,
 }
 
 # ------------------------------------------------------------------------------
-# Helper Function: create_study_specific_practical_guide
-# Description: Creates a simplified practical guide for a single study (Panel D fallback)
+# Helper: create_study_specific_practical_guide (Panel D fallback)
+# ------------------------------------------------------------------------------
+# Purpose:  When core taxa data is unavailable (e.g., low-sample studies),
+#           replace Panel D with a monospaced text summary showing pass/fail
+#           status across all taxonomic levels, beta-diversity warnings, and
+#           an overall inclusion recommendation.
+# Params:   study_data — list with $study_name, $primer_name, $dissim_data, etc.
+#           verdict_df — verdict rows for this study (all levels).
+# Returns:  ggplot object with annotate("text") — a formatted text panel.
 # ------------------------------------------------------------------------------
 create_study_specific_practical_guide <- function(study_data, verdict_df) {
   
@@ -950,17 +1061,26 @@ create_study_specific_practical_guide <- function(study_data, verdict_df) {
 }
 
 # ==============================================================================
-# SECTION 5: IMPROVED MASTER SUMMARY FUNCTIONS
-# These functions generate the visualizations for the "Master Summary Report".
+# SECTION 5: MASTER SUMMARY FUNCTIONS
+# These generate cross-study visualisations for the "Master Summary Report":
+#   - Trimming recommendations forest plot (safe thresholds by level)
+#   - Amplicon alignment map (consensus region + degradation zones)
+#   - Practical study inclusion guide (text-based recommendation table)
+#   - Method performance comparison (which detection methods fire most)
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
 # Function: create_trimming_recommendations
-# Description: Generates a Forest Plot summarizing the "Safe Trimming Thresholds"
-#              across all studies for each taxonomic level.
-#              - Red Dot: Median Threshold.
-#              - Blue Bar: Interquartile Range (IQR).
-#              - Text: Pass Rate %.
+# ------------------------------------------------------------------------------
+# Purpose:  Forest plot summarising safe trimming thresholds across ALL studies
+#           at each taxonomic level. Helps users choose a trimming length that
+#           preserves community structure for the majority of studies.
+# Visual encoding:
+#   Red dot   = median threshold (BP) across studies.
+#   Blue bar  = IQR (25th-75th percentile) of thresholds.
+#   Text      = pass rate percentage.
+# Params:   None (reads global master_verdicts).
+# Returns:  ggplot object or NULL if no data.
 # ------------------------------------------------------------------------------
 create_trimming_recommendations <- function() {
     message("--- Creating trimming recommendations ---")
@@ -1042,10 +1162,27 @@ create_trimming_recommendations <- function() {
 
 # ------------------------------------------------------------------------------
 # Function: create_amplicon_alignment_plot
-# Description: Visualizes the alignment of all studies relative to the 16S gene.
-#              - Handles both "Study Mode" (global alignment) and "Primer Mode" (local).
-#              - Automatically detects Coordinate System (E. coli vs SILVA).
-#              - Now reads consensus from consensusregioninfo.csv to avoid recalculation.
+# ------------------------------------------------------------------------------
+# Purpose:  Visualise all studies as horizontal segments on a shared 16S rRNA
+#           coordinate axis, colour-coded by degradation status within the
+#           consensus overlap region. This is the key figure for understanding
+#           how amplicon coverage and trimming thresholds interact spatially.
+#
+# Colour encoding:
+#   Green         = safe region within consensus overlap.
+#   Light orange  = overhang outside consensus (not comparable across studies).
+#   Dark orange   = caution zone (single-method warning, not confirmed).
+#   Red           = confirmed degradation zone (multi-method consensus).
+#   Grey          = outlier study (excluded from consensus calculation).
+#
+# Coordinate systems: auto-detected from data range.
+#   >5000 -> SILVA 138.1 SSU alignment columns (V-regions mapped via Yarza 2014).
+#   <=5000 -> E. coli K-12 16S bp positions.
+#
+# Params:   master_manifest  — study metadata (primer names, etc.).
+#           master_verdicts  — verdict table with thresholds.
+#           taxonomic_level  — which level to display (default "Family").
+# Returns:  ggplot object or NULL.
 # ------------------------------------------------------------------------------
 create_amplicon_alignment_plot <- function(master_manifest, master_verdicts, taxonomic_level = "Family") {
     message(paste("--- Creating amplicon alignment visualization for:", taxonomic_level, "---"))
@@ -1222,6 +1359,11 @@ Is_Warning_Only = !is.na(Consensus_Status) & Consensus_Status == "WARNING_SINGLE
         )
 
 # --- 5. CREATE PLOT SEGMENTS ---
+    # Each study's amplicon is split into coloured segments based on where
+    # degradation falls relative to the consensus overlap region. The loop
+    # below handles five cases: outlier, no degradation, degradation in
+    # overhang only, and degradation inside consensus (with/without two-stage
+    # inner/outer boundaries from the consensus voting system).
     add_seg <- function(segs, study, pos, start, end, type) {
         if (is.na(start) || is.na(end) || end <= start) return(segs)
         dplyr::bind_rows(segs, tibble::tibble(
@@ -1355,6 +1497,9 @@ Is_Warning_Only = !is.na(Consensus_Status) & Consensus_Status == "WARNING_SINGLE
     }
 
             # --- 6. DEFINE V-REGIONS (Coordinate System Detection) ---
+    # Two lookup tables for 16S variable regions: one in SILVA alignment column
+    # coordinates (for studies aligned via DECIPHER), one in E. coli bp (legacy).
+    # The choice is automatic based on the max coordinate value in the data.
     # V-region positions in SILVA 138.1 SSU alignment column coordinates
     # (i.e. which(chars != "-") space, matching the ref_start/ref_end values in
     # study_alignment_coords.csv produced by secat_mapping.R via DECIPHER::AlignProfiles)
@@ -1450,8 +1595,14 @@ Is_Warning_Only = !is.na(Consensus_Status) & Consensus_Status == "WARNING_SINGLE
 
 # ------------------------------------------------------------------------------
 # Function: create_practical_guide
-# Description: Generates a practical study inclusion guide showing which studies
-#              can be safely included at each taxonomic level.
+# ------------------------------------------------------------------------------
+# Purpose:  Generate a monospaced text panel recommending which studies to
+#           include in downstream meta-analysis at each taxonomic level. Checks
+#           both statistical thresholds AND beta-diversity magnitude at the
+#           target trim point (DISSIM_WARNING_THRESHOLD, default 0.08).
+#           Outputs conservative vs. moderate inclusion lists with study counts.
+# Params:   None (reads global master_verdicts, loads per-study RDS as needed).
+# Returns:  ggplot object (text-annotated plot) or NULL.
 # ------------------------------------------------------------------------------
 create_practical_guide <- function() {
     message("--- Creating practical study inclusion guide ---")
@@ -1737,8 +1888,14 @@ create_practical_guide <- function() {
 
 # ------------------------------------------------------------------------------
 # Function: create_method_performance_plot
-# Description: Compares which detection methods (Changepoint, Cutoff, Null Model)
-#              are triggering the most often and at what thresholds.
+# ------------------------------------------------------------------------------
+# Purpose:  Cleveland dot plot comparing the three degradation detection methods
+#           (Changepoint, Distance Cutoff, Null Model) across taxonomic levels.
+#           Shows the median threshold (BP) at which each method triggers —
+#           useful for diagnosing whether one method is systematically more
+#           conservative than the others, which informs consensus voting tuning.
+# Params:   None (reads global master_verdicts).
+# Returns:  ggplot object or NULL.
 # ------------------------------------------------------------------------------
 create_method_performance_plot <- function() {
     message("--- Creating method performance comparison plot ---")
@@ -1809,9 +1966,24 @@ create_method_performance_plot <- function() {
 
 # ==============================================================================
 # SECTION 6: MAIN PROCESSING LOOP
-# This loop iterates through every study's RDS result file, generates the
-# individual plots, and compiles them into per-study PDF reports.
+# Iterates through every study's RDS result file (from 06_analyse_real.R),
+# generates four-panel diagnostic plots at each taxonomic level (Phylum
+# through ASV), and assembles them into per-study multi-page PDFs.
+# Then generates a single Master Summary PDF with cross-study visualisations.
+#
+# Workflow per study:
+#   1. Load RDS -> extract study_name, primer, increment, data extent.
+#   2. Filter verdicts and simulation baselines to this study.
+#   3. For each taxonomic level: generate Panels A-D, combine with patchwork,
+#      save as temporary PNG.
+#   4. Stitch PNGs into a single PDF (one page per taxonomic level).
+#   5. Clean up temporary files.
 # ==============================================================================
+
+# --- check_report_exists ---
+# Purpose:  Skip already-generated reports when FORCE_REGENERATE is FALSE.
+# Params:   study_name, primer — used to construct expected filename.
+# Returns:  logical.
 check_report_exists <- function(study_name, primer) {
   file.exists(file.path(output_dir, paste0("Report_Fixed_", study_name, "_", primer, ".pdf")))
 }
@@ -1884,6 +2056,9 @@ if (!SKIP_INDIVIDUAL) {
 
             # -----------------------------------------------------------
             # DETERMINE PLOTTING RANGES (MODE-AWARE)
+            # The x-axis must extend far enough to show both the data endpoint
+            # and the required threshold (green line), whichever is larger.
+            # Over-padding is avoided to prevent spurious visual extrapolation.
             # -----------------------------------------------------------
 
             # 1. Observed Max (BP) - Where the data actually stops
@@ -1974,6 +2149,14 @@ if (!SKIP_INDIVIDUAL) {
                 }
 
                 # --- VERDICT LOGIC (v3.2 consensus-aware) ---
+                # Determines the plot subtitle text and which threshold lines
+                # to draw. Four verdict categories:
+                #   PASS          — no confirmed degradation, green line only.
+                #   CAUTION       — single method triggered (WARNING_SINGLE),
+                #                   orange line drawn, no red line.
+                #   FAIL          — confirmed degradation before required trim,
+                #                   red line drawn.
+                #   FAIL (Outlier)— study excluded from consensus entirely.
 
                 # 1. Check Outlier Status
                 is_outlier <- FALSE
@@ -2076,7 +2259,9 @@ if (!SKIP_INDIVIDUAL) {
                                       "| Observed:", subtitle_obs,
                                       "| Verdict:", mainverdict)
 
-                # Generate the 4 Panels
+                # Generate the 4 diagnostic panels for this taxonomic level:
+                #   p1 = Panel A (dissimilarity), p2 = Panel B (retention),
+                #   p3 = Panel C (taxon impact),  p4 = Panel D (core taxa)
 	p1 <- plot_dissimilarity_robust(current_study_data, sim_baseline_level_data, level_verdict_for_plotting, obs_max_step_bp, current_level, observed_thresh_bp, plot_max_step_index, warning_thresh_bp = warning_thresh_bp)
 	p2 <- plot_retention_robust(current_study_data, sim_retention_level_data, level_verdict_for_plotting, obs_max_step_bp, current_level, observed_thresh_bp, plot_max_step_index, warning_thresh_bp = warning_thresh_bp)
 	p3 <- plot_taxon_impact_combined(current_study_data, level_verdict_for_plotting, current_level, obs_max_step_bp, observed_thresh_bp, plot_max_step_index, warning_thresh_bp = warning_thresh_bp)
@@ -2104,7 +2289,9 @@ if (!SKIP_INDIVIDUAL) {
                 gc()
             }
 
-            # Write PNGs into PDF using R graphics device (avoids ImageMagick)
+            # Write PNGs into PDF using R's native pdf() device + grid::grid.raster().
+            # This avoids the ImageMagick dependency entirely — important for HPC
+            # environments where ImageMagick may not be installed.
             if (length(png_files_for_pdf) > 0) {
                 message(paste("  → Creating PDF with", length(png_files_for_pdf), "pages..."))
                 tryCatch({
@@ -2140,6 +2327,12 @@ if (!SKIP_INDIVIDUAL) {
 
 # ------------------------------------------------------------------------------
 # 6B. Master Summary Report Generation
+# One PDF combining cross-study visualisations:
+#   - Amplicon alignment maps (one per taxonomic level, 6 pages)
+#   - Trimming recommendations forest plot
+#   - Practical study inclusion guide
+#   - Method performance comparison
+# This is the primary deliverable for systematic review decision-making.
 # ------------------------------------------------------------------------------
 message("\n--- Creating Improved Master Summary Report ---")
 
@@ -2249,7 +2442,9 @@ tryCatch({
     message(paste("     Traceback:", paste(capture.output(traceback()), collapse = "\n")))
 })
 
-# Final Stats Log
+# --- Final Stats Log ---
+# Report counts for pipeline logging; non-zero skipped_reports is expected
+# when FORCE_REGENERATE = FALSE (incremental re-runs).
 message("\n=== REPORT GENERATION COMPLETE ===")
 if(exists("successful_reports") && exists("skipped_reports")) {
     message(paste("Successful individual reports:", successful_reports))

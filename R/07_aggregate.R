@@ -1,29 +1,62 @@
 #!/usr/bin/env Rscript
 # ==============================================================================
-# SCRIPT:   scripts/07_aggregate.R
-# PIPELINE: SeCAT (Sequence Consensus Analysis Tool)
-# PHASE:    Phase 5: Aggregation & Statistical Verdicts
-# VERSION:  3.0 (Memory Optimized & Dual-Mode)
-# AUTHOR:   [Author Name]
+# SCRIPT:   07_aggregate.R
+# PIPELINE: SeCAT v4.1 (Sequence Consensus Amplicon Trimming)
+# STAGE:    Stage 7 — Aggregation & Statistical Verdicts
+# PURPOSE:  Statistical core that determines the maximum safe trim depth per study
 #
-# PURPOSE:
-#   This is the "Reducer" script. It collects the results from:
-#   1. All Real Data Analysis jobs (Phase 4)
-#   2. All Simulation jobs (Phase 3)
+# OVERVIEW:
+#   The "Reducer" of the SeCAT pipeline. Collects real-data degradation curves
+#   (Stage 6) and simulation null distributions (Stage 4/5) across all studies
+#   and taxonomic levels, then applies three independent statistical methods to
+#   locate where sequence trimming causes unacceptable community distortion:
+#     (1) PELT changepoint detection on the real Bray-Curtis degradation curve,
+#     (2) empirical p-value comparison of real vs. simulated degradation at
+#         each trim step (null model test),
+#     (3) absolute distance cutoff on step-wise Bray-Curtis change.
+#   A consensus voting system confirms degradation only when >= 2 methods
+#   agree within a tolerance window, reducing false positives. Hard quality
+#   gates (BC ceiling, retention floor) override consensus when breached.
+#   The final output is a master verdict table (KEEP / EXCLUDE per study per
+#   taxonomic level) consumed by the report generator (Stage 8) and the
+#   verdict exporter (Stage 10).
 #
-#   It performs the final statistical comparisons to generate "Verdicts" for
-#   each study:
-#   - Is the observed degradation significantly worse than the null model?
-#   - Where is the "tipping point" (changepoint)?
-#   - Does the study fail the absolute cutoff?
+# INPUTS:
+#   - output/real_data_results/<task_id>/<task_id>_results.rds — per-study RDS
+#     containing dissimilarity curves, retention data, OTU tables, and metadata
+#   - output/simulation_results/<task_id>/<seed>/results.rds — per-simulation
+#     replicate RDS files with randomised degradation curves
+#   - output/intermediate/consensusregioninfo.csv — outlier study list
 #
-#   Finally, it produces the Master CSV tables used by the Report Generator.
+# OUTPUTS:
+#   - output/aggregated_data/master_verdict_table.csv — KEEP/EXCLUDE verdicts
+#   - output/aggregated_data/simulation_baseline_statistics.csv — null model
+#     summary statistics (mean, SD, 95% CI per trim step per level)
+#   - output/aggregated_data/simulation_retention_curves.csv — retention baselines
+#   - output/aggregated_data/taxon_impact_<study>.csv — per-study taxon impact
+#   - output/aggregated_data/retention_summary_<study>.csv — ASV/read retention
+#   - output/aggregated_data/alpha_diversity_<study>.csv — Shannon/Observed
+#   - output/aggregated_data/master_*.csv — combined summary tables
 #
-# MEMORY OPTIMIZATION:
-#   Because simulation data can be massive (TB scale), this script uses
-#   batch processing and streaming writes to keep RAM usage low (<10GB).
+# DEPENDENCIES:
+#   - dplyr, tidyr, ggplot2, readr, stringr, purrr, tibble, here,
+#     changepoint (PELT algorithm), vegan (diversity metrics)
+#   - R/secat_config.R, R/secat_utils.R
+#
+# MEMORY OPTIMISATION:
+#   Simulation data can reach TB scale. This script uses batch loading
+#   (25 files at a time), streaming CSV writes, and aggressive gc() calls
+#   to keep peak RAM usage manageable (< 10 GB).
+#
+# CALLED BY:
+#   - Nextflow aggregation process (Stage 7)
 # ==============================================================================
 
+# ------------------------------------------------------------------------------
+# Function: log_and_flush
+# Purpose:  Timestamped logging with immediate console flush for real-time
+#           monitoring in batch/cluster environments where stdout is buffered.
+# ------------------------------------------------------------------------------
 log_and_flush <- function(message) {
   cat(paste(Sys.time(), "|", message, "\n"))
   flush.console()
@@ -33,30 +66,64 @@ log_and_flush <- function(message) {
 # SECTION 1: STATISTICAL HELPER FUNCTIONS
 # ==============================================================================
 
+# ------------------------------------------------------------------------------
 # Function: get_first_degradation_threshold
-# Description: Helper to find the most conservative (lowest BP) threshold triggered.
+# Purpose:  Find the most conservative (lowest BP) threshold across all three
+#           detection methods. Returns the earliest trim position at which any
+#           method flagged degradation, or NA if no method triggered.
+#
+# Parameters:
+#   @param vdf [data.frame] - Single-row verdict dataframe for one study x level
+#
+# Returns:
+#   @return [numeric] - Minimum triggered threshold in base pairs, or NA
+# ------------------------------------------------------------------------------
 get_first_degradation_threshold <- function(vdf) {
   all_thresholds <- c(vdf$Threshold_Observed_Changepoint, vdf$Threshold_Observed_Cutoff, vdf$Threshold_Observed_NullModel)
   all_thresholds <- all_thresholds[!is.na(all_thresholds)]
   if (length(all_thresholds) == 0) return(NA_real_) else return(min(all_thresholds))
 }
 
+# ------------------------------------------------------------------------------
+# Function: get_levels
+# Purpose:  Return the canonical taxonomic hierarchy used throughout SeCAT.
+#           Order matters: coarser levels first, ASV (finest) last.
+# ------------------------------------------------------------------------------
 get_levels <- function() {
   return(c("Phylum", "Class", "Order", "Family", "Genus", "ASV"))
 }
 
 # ------------------------------------------------------------------------------
 # Function: select_changepoint_penalty_cv
-# Description: Selects the optimal penalty for PELT changepoint detection using
-#              bootstrap cross-validation. This prevents "over-fitting" where
-#              tiny fluctuations are flagged as changepoints.
+# Purpose:  Select the optimal penalty multiplier for PELT changepoint detection
+#           via bootstrap cross-validation. The PELT (Pruned Exact Linear Time)
+#           algorithm segments a time series into regions of different mean/variance.
+#           The penalty controls sensitivity: too low -> spurious changepoints from
+#           noise; too high -> real shifts are missed. This function scans a range
+#           of penalty multipliers, runs bootstrap replicates at each, and selects
+#           the multiplier that produces the most stable (highest consensus fraction)
+#           changepoint location.
 #
-# Args:
-#   y: Numeric vector of dissimilarity values.
-#   trim_bp: Numeric vector of trim positions.
-#   penalty_method: "AIC", "SIC", or "MANUAL".
-#   scan: Vector of penalty multipliers to test.
-#   nboot: Number of bootstrap replicates.
+# Parameters:
+#   @param y            [numeric] - Bray-Curtis dissimilarity values along the curve
+#   @param trim_bp      [numeric] - Trim positions in base pairs (same length as y)
+#   @param penalty_method [character] - "AIC", "SIC", or "MANUAL" penalty scaling
+#   @param scan         [numeric] - Vector of penalty multipliers to evaluate
+#   @param nboot        [integer] - Number of bootstrap replicates per multiplier
+#   @param min_trim_bp  [numeric] - Minimum trim position to include (filters noise
+#                         at very short trims where community is barely affected)
+#
+# Returns:
+#   @return [list] - penalty_mult: optimal multiplier; changepoint_bp: consensus
+#           changepoint position (bp); consensus_frac: proportion of bootstrap
+#           replicates that agreed on this location (stability score, 0-1)
+#
+# Notes:
+#   The bootstrap consensus approach is robust to outlier trim steps. A high
+#   consensus_frac (> 0.6) indicates a genuine structural break in the degradation
+#   curve; low values suggest the curve degrades gradually without a clear tipping
+#   point. When multiple multipliers tie on consensus fraction, the lowest (most
+#   sensitive) multiplier is preferred to err on the side of caution.
 # ------------------------------------------------------------------------------
 select_changepoint_penalty_cv <- function(y, trim_bp, penalty_method, scan, nboot, min_trim_bp = 10) {
   requireNamespace("changepoint")

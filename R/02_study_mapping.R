@@ -1,38 +1,45 @@
 #!/usr/bin/env Rscript
-#===============================================================================
-# SCRIPT:   scripts/02_study_mapping.R
-# PIPELINE: SeCAT (Sequence Consensus Analysis Tool)
-# PHASE:    Phase 2: Individual Study Mapping (Worker)
-# TYPE:     SGE Array Job Worker
-# VERSION:  2.0 (Robust Validation)
-# AUTHOR:   [Author Name]
+# ==============================================================================
+# SCRIPT:   02_study_mapping.R
+# PIPELINE: SeCAT v4.1 (Sequence Consensus Amplicon Trimming)
+# STAGE:    Stage 2 — Individual Study Coordinate Mapping (Worker)
+# PURPOSE:  Align one study's ASVs to the SILVA reference and determine its
+#           amplicon start/end coordinates in reference alignment space.
 #
-# PURPOSE:
-#   This is the computational workhorse of Phase 2. It is designed to be run as
-#   an Array Job. It processes a SINGLE study (determined by SGE_TASK_ID) to
-#   identify its genomic coordinates.
+# OVERVIEW:
+#   This is an array-job worker script: each instance processes a single study
+#   (identified by task ID) from the manifest. It aligns the study's ASV
+#   sequences to the SILVA reference using DECIPHER (profile-to-profile MSA),
+#   then determines the study's amplicon boundaries by finding the modal
+#   start/end positions across all aligned ASVs. These empirical coordinates
+#   replace the theoretical primer-based coordinates (used in primer mode)
+#   with actual alignment-derived positions that account for study-specific
+#   biases (primer slippage, trimming artefacts, sequencing platform effects).
 #
-# WORKFLOW:
-#   1. Reads the SGE_TASK_ID environment variable (1, 2, 3...).
-#   2. Loads the master manifest and selects the corresponding row (Study N).
-#   3. Calls `map_study_to_reference()` (from R/secat_mapping.R) to:
-#      - Align the study's ASVs to the reference (Study Mode) OR
-#      - Parse primer names (Legacy Mode).
-#   4. Saves the results:
-#      - Summary CSV (Study start/end).
-#      - (Optional) Per-ASV coordinate table.
-#      - (Optional) Aligned FASTA file.
+#   The mapping parts from all studies are collected by the COLLECT_MAPS
+#   process and merged into study_alignment_coords.csv for consensus
+#   region calculation.
 #
 # INPUTS:
-#   - Environment Variable: SGE_TASK_ID
-#   - Manifest: [SECAT_MANIFEST_PATH]
-#   - Data: ASV FASTA files referenced in the manifest.
+#   - SGE_TASK_ID environment variable (1-indexed study number)
+#   - SECAT_MANIFEST_PATH: cleaned manifest TSV
+#   - ASV FASTA files referenced in the manifest
+#   - REFERENCE_DB_PATH: SILVA aligned FASTA
 #
 # OUTPUTS:
-#   - output/intermediate/study_mapping_parts/mapping_part_X.csv
-#   - output/intermediate/asv_coordinates/*
-#   - output/intermediate/aligned_fastas/*
-#===============================================================================
+#   - output/intermediate/study_mapping_parts/mapping_part_<N>.csv
+#     (study-level summary: study_name, ref_start, ref_end)
+#   - output/intermediate/asv_coordinates/<study>_coords.csv (per-ASV positions)
+#   - output/intermediate/aligned_fastas/<study>_aligned.fasta (MSA output)
+#
+# DEPENDENCIES:
+#   - R/secat_config.R: global paths and configuration
+#   - R/secat_mapping.R: map_study_to_reference() alignment engine
+#   - Biostrings: FASTA I/O
+#
+# CALLED BY:
+#   - modules/local/study_mapping.nf (STUDY_MAPPING process)
+# ==============================================================================
 
 # Wrap entire execution in tryCatch for robust error reporting in cluster logs
 tryCatch({

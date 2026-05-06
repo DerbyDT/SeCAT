@@ -1,63 +1,45 @@
-#===============================================================================
-# FILENAME:   R/secat_utils.R
-# PIPELINE:   SeCAT (Sequence Consensus Analysis Tool)
-# VERSION:    1.0.0 (as of 2025-12-10)
-# AUTHOR:     [Author Name]
+# ==============================================================================
+# SCRIPT:   secat_utils.R
+# PIPELINE: SeCAT v4.1 (Sequence Consensus Amplicon Trimming)
+# PURPOSE:  Core utility library — provides all shared functions for data
+#           loading, community simulation, beta-diversity analysis, VSEARCH
+#           clustering, taxonomic processing, and statistical identification
+#           of trimming degradation points.
 #
-# PURPOSE:
-#   Provides a centralized library of core utility functions for the SeCAT
-#   pipeline. This script contains functions for data loading, validation,
-#   community simulation, taxonomic analysis, and the statistical identification
-#   of signal degradation points in trimmed sequence data.
+# OVERVIEW:
+#   This library is the functional backbone of the SeCAT pipeline. It is
+#   sourced by every analysis script and contains functions spanning:
+#   - General utilities (mode calculation, safe accessors)
+#   - Null model identification (empirical p-values, consecutive significance)
+#   - Community simulation (lognormal SAD, PCR bias, sequencing errors, chimeras)
+#   - Data loading and validation (manifest parsing, FASTA/OTU synchronisation)
+#   - Beta-diversity computation (Bray-Curtis at multiple taxonomic levels)
+#   - VSEARCH integration (de novo clustering, .uc file parsing)
+#   - Changepoint detection (PELT algorithm wrappers)
+#   - Taxonomic retention and core taxa tracking
 #
-# DESCRIPTION:
-#   This library is the functional backbone of the SeCAT pipeline, designed to
-#   be sourced by various orchestration and analysis scripts. It is organized
-#   into several logical sections:
-#
-#   1.  GENERAL PURPOSE UTILITIES: Basic helper functions (e.g., mode calculation).
-#   2.  NULL MODEL IDENTIFICATION: Statistical functions to determine at what
-#       trimming depth the change in diversity is no longer distinguishable from
-#       random chance (the "null model"). This is critical for objectively
-#       defining a valid consensus region.
-#   3.  COMMUNITY SIMULATION & MANIPULATION: Functions to generate synthetic
-#       microbial communities and process OTU tables, including clustering
-#       results from tools like VSEARCH (via .uc files).
-#   4.  DATA LOADING & VALIDATION: Robust functions for reading, synchronizing,
-#       and validating the primary input data (ASV tables, FASTA files,
-#       taxonomy) specified in the master manifest.
-#
-# CRITICAL FIXES APPLIED (from original header):
-#   - Beta diversity calculation with proper table alignment.
-#   - Retention calculation with correct logic.
-#   - Backfilling with zero-abundance tables for missing data.
-#   - Robust NA/NULL handling throughout.
-#
-# STYLE GUIDE:
-#   - Functions are documented using a consistent header format.
-#   - `dplyr` and `tidyverse` conventions are used for data manipulation.
-#   - Explicit error handling and informative messages are prioritized.
-#
-#===============================================================================
+# SOURCED BY:
+#   - 04_prepare_sims.R, 05_sim_worker.R, 06_analyse_real.R, 07_aggregate.R,
+#     08_gen_report.R, 12_trim_sequences.R, 13_merge_datasets.R, and others
+# ==============================================================================
 
-#===============================================================================
+# ==============================================================================
 # SECTION 1: GENERAL PURPOSE UTILITIES
-#===============================================================================
+# Helper functions for basic statistical operations and safe access to
+# pipeline configuration variables.
+# ==============================================================================
 
-#-------------------------------------------------------------------------------
-# Function:   calculate_mode
-#-------------------------------------------------------------------------------
-# Description:
-#   Calculates the statistical mode (most frequent value) of a vector.
+# ------------------------------------------------------------------------------
+# Function: calculate_mode
+# Purpose:  Calculates the statistical mode (most frequent value) of a vector.
 #
 # Parameters:
 #   @param x [vector] - A vector of numbers or characters.
 #
 # Returns:
-#   @return [any] - The most frequent value in the vector. Returns NA if the
-#           input vector is empty or contains only NAs. In case of a tie,
-#           the first encountered maximum is returned by `which.max`.
-#-------------------------------------------------------------------------------
+#   @return [any] - The most frequent value. Returns NA for empty/all-NA input.
+#           Ties are broken by first occurrence (which.max behaviour).
+# ------------------------------------------------------------------------------
 
 calculate_mode <- function(x) {
   x <- x[!is.na(x)]
@@ -66,27 +48,21 @@ calculate_mode <- function(x) {
   unique_x[which.max(tabulate(match(x, unique_x)))]
 }
 
-#-------------------------------------------------------------------------------
-# Function:   get_levels
-#-------------------------------------------------------------------------------
-# Description:
-#   Safely retrieves the taxonomic levels for analysis from the global
-#   environment. Provides a default set of levels if the global variable
-#   is not defined.
+# ------------------------------------------------------------------------------
+# Function: get_levels
+# Purpose:  Safely retrieves the taxonomic levels for analysis from the global
+#           environment, falling back to a sensible default (Phylum-Genus).
 #
-# Scientific Context:
-#   This function standardizes which taxonomic ranks (e.g., Phylum, Genus)
-#   will be included in downstream diversity analyses, ensuring consistency
-#   across different scripts. The ability to fall back to a default makes the
-#   pipeline more robust to configuration errors.
-#
-# Global Dependencies:
-#   - TAXONOMIC_LEVELS_TO_ANALYSE [character vector]: Expected to be defined in
-#     the global environment, typically sourced from the `secat_config.R` file.
+# Parameters:
+#   (none) - reads TAXONOMIC_LEVELS_TO_ANALYSE from global env (secat_config.R)
 #
 # Returns:
-#   @return [character vector] - A vector of taxonomic rank names.
-#-------------------------------------------------------------------------------
+#   @return [character] - Vector of taxonomic rank names to iterate over.
+#
+# Notes:
+#   Standardises which ranks are included in diversity analyses across all
+#   scripts. The fallback prevents crashes when config has not been sourced.
+# ------------------------------------------------------------------------------
 get_levels <- function() {
   # Check if the variable from R exists.
   if (exists("TAXONOMIC_LEVELS_TO_ANALYSE")) {
@@ -100,65 +76,46 @@ get_levels <- function() {
   }
 }
 
-#===============================================================================
+# ==============================================================================
 # SECTION 2: NULL MODEL & DEGRADATION POINT IDENTIFICATION
-#===============================================================================
-# These functions implement the core statistical logic of SeCAT. They compare
-# the observed change in beta diversity from trimming real data against a null
-# distribution of changes from trimming simulated data. This allows for the
-# data-driven identification of trimming lengths where the observed community
-# structure begins to degrade non-randomly.
-#===============================================================================
+# Core statistical logic of SeCAT. Compares observed delta-D (change in
+# beta diversity from trimming real data) against a null distribution derived
+# from simulated communities, enabling data-driven detection of the trimming
+# depth where community structure degrades non-randomly.
+# ==============================================================================
 
-#-------------------------------------------------------------------------------
-# Function:   find_null_model_point
-#-------------------------------------------------------------------------------
-# Description:
-#   Identifies the "null model" trimming point. This is the first trimming
-#   depth at which the change in community dissimilarity (delta-D) for the
-#   *real data* is NOT significantly different from the changes observed in
-#   *simulated data* for a sustained number of steps.
-#
-# Scientific Context:
-#   As sequences are trimmed, beta diversity can change due to both stochastic
-#   effects (random noise, minor sequence variations) and systematic bias
-#   (non-random loss of taxonomic information). This function finds the point
-#   where the observed change is statistically indistinguishable from the
-#   random noise modeled by the simulations. This point represents a conservative
-#   estimate of where true signal may be lost.
-#
-# Algorithm:
-#   1. For each trimming step (`Trim_BP`) in the real data curve:
-#   2. Calculate the change in dissimilarity (`delta_D`) from the previous step.
-#   3. For the same trimming interval, calculate a distribution of `delta_D`
-#      values from all corresponding simulations.
-#   4. Calculate an empirical p-value: (sum(sim_deltas >= real_delta_D) + 1) / (N_sims + 1).
-#      This tests the null hypothesis that the real `delta_D` is drawn from the
-#      same distribution as the simulated `delta_D`s.
-#   5. Identify the *first* `Trim_BP` that begins a window of `min_consecutive_steps`
-#      where all p-values are *less than* `empirical_p_threshold`. This signifies
-#      a region where the real data consistently changes *less* than the simulated
-#      data, indicating it has entered the noise-dominated "null" phase.
+# ------------------------------------------------------------------------------
+# Function: find_null_model_point
+# Purpose:  Identifies the first trimming depth at which the real delta-D
+#           becomes statistically indistinguishable from simulated delta-D
+#           for a sustained window of consecutive steps.
 #
 # Parameters:
-#   @param real_curve [data.frame] - A data frame of dissimilarity vs. trim depth
-#          for the real data. Requires columns: `Level`, `Trim_BP`, `Dissimilarity`.
-#   @param sim_dissim_data [data.frame] - A data frame of dissimilarity vs. trim
-#          depth for all simulations. Requires: `task_id`, `Level`, `Trim_BP`,
-#          `Dissimilarity`, `simulation_id`.
-#   @param level [character] - The taxonomic level to analyze (e.g., "Genus").
-#   @param task_id [character] - The identifier for the current study/task.
-#   @param empirical_p_threshold [numeric] - P-value cutoff for significance.
-#   @param min_consecutive_steps [integer] - How many consecutive non-significant
-#          steps are required to define the null model point.
-#   @param min_trim_bp [integer] - The minimum trimming depth to consider, to avoid
-#          initial instability at low trim values.
+#   @param real_curve      [data.frame] - Dissimilarity vs trim depth for real
+#          data. Requires: Level, Trim_BP, Dissimilarity.
+#   @param sim_dissim_data [data.frame] - Dissimilarity vs trim depth for all
+#          simulations. Requires: task_id, Level, Trim_BP, Dissimilarity,
+#          simulation_id.
+#   @param level           [character] - Taxonomic level (e.g., "Genus").
+#   @param task_id         [character] - Study/task identifier.
+#   @param empirical_p_threshold  [numeric] - P-value cutoff (default 0.05).
+#   @param min_consecutive_steps  [integer] - Consecutive non-significant steps
+#          needed to declare the null model point (default 3).
+#   @param min_trim_bp     [integer] - Minimum trim depth to consider, avoiding
+#          initial instability at short trims (default 10).
 #
 # Returns:
-#   @return [list] - A list containing `nullmodel_bp` (the identified trim depth)
-#           and `empirical_p_value` (the p-value at that point). Returns NA for
-#           both if no such point is found.
-#-------------------------------------------------------------------------------
+#   @return [list] - nullmodel_bp (trim depth in bp) and empirical_p_value at
+#           that point. Both NA if no sustained non-significant window found.
+#
+# Notes:
+#   Algorithm: For each step, compute delta-D (change in dissimilarity from
+#   previous step) for real data, then build a null distribution of delta-D
+#   from all simulations at the same interval. Empirical p-value =
+#   (sum(sim_deltas >= real_delta) + 1) / (N_sims + 1), following North et al.
+#   (2002). A sliding window of min_consecutive_steps where all p < threshold
+#   indicates the real data has entered the noise-dominated "null" phase.
+# ------------------------------------------------------------------------------
 
 find_null_model_point <- function(real_curve, sim_dissim_data, level, task_id, empirical_p_threshold = 0.05, min_consecutive_steps = 3, min_trim_bp = 10) {
     sub_real <- real_curve %>% dplyr::filter(Level == level, Trim_BP >= 0) %>% dplyr::arrange(Trim_BP)
@@ -219,45 +176,32 @@ find_null_model_point <- function(real_curve, sim_dissim_data, level, task_id, e
     list(nullmodel_bp = NA_real_, empirical_p_value = NA_real_)
 }
 
-#-------------------------------------------------------------------------------
-# Function:   find_degradation_point
-#-------------------------------------------------------------------------------
-# Description:
-#   Identifies the "degradation point". This is the first trimming depth at
-#   which the change in community dissimilarity (`delta_D`) for the real data
-#   exceeds a fixed, absolute threshold (`distance_cutoff`).
-#
-# Scientific Context:
-#   While `find_null_model_point` uses a relative, simulation-based cutoff, this
-#   function provides an absolute backstop. It flags any single trimming step
-#   that causes a large, immediate jump in beta diversity, which is a strong
-#   indicator of non-random, systematic loss of key taxa (i.e., information
-#   degradation). It serves as a complementary heuristic to the null model.
-#
-# Algorithm:
-#   1. For each trimming step (`Trim_BP`) in the real data curve:
-#   2. Calculate the change in dissimilarity (`delta_D`) from the previous step.
-#   3. If `delta_D` is greater than the pre-defined `distance_cutoff`:
-#   4. Return this `Trim_BP` as the degradation point.
-#   5. As a secondary metric, it also calculates the empirical p-value at this
-#      point for reporting purposes, but the p-value is not used for the decision.
+# ------------------------------------------------------------------------------
+# Function: find_degradation_point
+# Purpose:  Identifies the first trimming depth where delta-D exceeds a fixed
+#           absolute threshold, serving as a hard backstop complementary to the
+#           simulation-based null model.
 #
 # Parameters:
-#   @param real_curve [data.frame] - See `find_null_model_point`.
-#   @param sim_dissim_data [data.frame] - See `find_null_model_point`.
-#   @param sim_dissim_baseline [data.frame] - (Not used in this implementation, but
-#          may be intended for other comparisons).
-#   @param level [character] - The taxonomic level to analyze.
-#   @param task_id [character] - The identifier for the current study/task.
-#   @param distance_cutoff [numeric] - The absolute dissimilarity change threshold
-#          that triggers the identification of the degradation point.
-#   @param min_trim_bp [integer] - The minimum trimming depth to consider.
+#   @param real_curve          [data.frame] - See find_null_model_point.
+#   @param sim_dissim_data     [data.frame] - See find_null_model_point.
+#   @param sim_dissim_baseline [data.frame] - Reserved for future comparisons.
+#   @param level               [character]  - Taxonomic level to analyse.
+#   @param task_id             [character]  - Study/task identifier.
+#   @param distance_cutoff     [numeric]    - Absolute delta-D threshold that
+#          flags degradation (default 0.15).
+#   @param min_trim_bp         [integer]    - Minimum trim depth to consider.
 #
 # Returns:
-#   @return [list] - A list containing `degradation_bp` (the identified trim
-#           depth) and `empirical_p_value` (the p-value at that point). Returns
-#           NA for both if no point exceeds the cutoff.
-#-------------------------------------------------------------------------------
+#   @return [list] - degradation_bp and empirical_p_value (for reporting).
+#           Both NA if no step exceeds the cutoff.
+#
+# Notes:
+#   Unlike find_null_model_point (relative, simulation-based), this detects any
+#   single large jump in Bray-Curtis dissimilarity -- a strong indicator of
+#   systematic loss of key taxa. The empirical p-value is calculated for
+#   reporting but does not drive the decision.
+# ------------------------------------------------------------------------------
 
 find_degradation_point <- function(real_curve, sim_dissim_data, sim_dissim_baseline, level, task_id, distance_cutoff = 0.15, min_trim_bp = 10) {
   sub_real <- real_curve %>% dplyr::filter(Level == level, Trim_BP >= 0) %>% dplyr::arrange(Trim_BP)
@@ -300,96 +244,46 @@ find_degradation_point <- function(real_curve, sim_dissim_data, sim_dissim_basel
   list(degradation_bp = NA_real_, empirical_p_value = NA_real_)
 }
 
-#===============================================================================
+# ==============================================================================
 # SECTION 3: COMMUNITY SIMULATION & MANIPULATION
-#===============================================================================
+# Functions to generate synthetic microbial communities with realistic technical
+# artifacts (PCR bias, sequencing errors, chimeras) and to process VSEARCH
+# clustering outputs (.uc files) into aggregated OTU tables.
+# ==============================================================================
 
-#-------------------------------------------------------------------------------
-# Function:   get_community
-#-------------------------------------------------------------------------------
-# Description:
-#   Generates a publication-quality synthetic microbial community with realistic
-#   technical artifacts including PCR amplification bias, Illumina sequencing 
-#   errors, and chimera formation.
-#
-# Scientific Context:
-#   This function creates the null model for SeCAT's statistical framework.
-#   Unlike simple random sampling, it explicitly models the technical biases
-#   that occur during amplicon sequencing (PCR preferential amplification,
-#   sequencing errors, chimeric artifacts). This ensures that observed differences
-#   between real data and simulated data reflect biological signal rather than
-#   insufficient noise modeling in the null hypothesis.
-#
-#   By comparing trimming effects on these realistic synthetic communities 
-#   versus actual study data, we can determine whether the observed information
-#   loss is greater than expected from technical variation alone.
-#
-# Algorithm (Grinder-Inspired):
-#   1. Random Sampling: Selects `ntaxas` sequences from SILVA reference database
-#      without replacement, ensuring taxonomic independence from study data.
-#
-#   2. Abundance Distribution: Generates initial relative abundances using a
-#      lognormal distribution (μ=5, σ=2) to mimic natural community structure
-#      (Preston 1948). Alternative models: uniform, powerlaw.
-#
-#   3. PCR Amplification Bias (Angly et al. 2012):
-#      - Calculates GC content for each sequence
-#      - Models cycle-dependent amplification: efficiency = 1 - 0.65×((GC-0.5)/0.15)²
-#      - Compounds bias over 25 PCR cycles (exponential effect)
-#      - Sequences with extreme GC content amplify 2-10× less efficiently
-#
-#   4. Sequencing Errors (Illumina MiSeq Model):
-#      - Base substitution rate: 0.3% (Schirmer et al. 2015)
-#      - Position-dependent: errors increase linearly toward 3' end
-#      - Transition bias: A↔G and C↔T transitions 70% of mutations
-#      - Indel rate: 0.003% (rare in Illumina chemistry)
-#
-#   5. Chimera Formation (Haas et al. 2011):
-#      - Generates chimeric sequences at 2% rate (typical for 16S PCR)
-#      - Random breakpoint model (20-80% of sequence length)
-#      - Chimera abundance = √(parent1 × parent2) × 0.1
-#
-#   6. Output Formatting: Returns normalized OTU table with diversity metrics
-#      for validation (Shannon index, evenness).
+# ------------------------------------------------------------------------------
+# Function: get_community
+# Purpose:  Generates a synthetic microbial community with realistic technical
+#           artifacts (PCR bias, sequencing errors, chimeras) for use as the
+#           SeCAT null model.
 #
 # Parameters:
-#   @param db_seq [DNAStringSet] - SILVA reference database (aligned sequences).
-#          Should be pre-subsampled for computational efficiency (~10k sequences).
-#   @param ntaxas [integer] - Number of distinct taxa to sample (default: 100).
-#          Represents realistic amplicon study complexity.
-#   @param seed [integer|NULL] - Random seed for reproducibility. If NULL, uses
-#          current RNG state.
+#   @param db_seq  [DNAStringSet] - SILVA reference database sequences.
+#   @param ntaxas  [integer]      - Number of taxa to sample (default 100).
+#   @param seed    [integer|NULL] - Random seed for reproducibility.
 #
 # Returns:
-#   @return [list] - A list containing:
-#           - `sequences`: [DNAStringSet] Aligned sequences with noise applied
-#           - `abundances`: [named numeric] Relative abundances (sum to 1.0)
-#           - `table`: [data.frame] OTU table (columns: OTU, abundance)
-#           - `metrics`: [list] Community metrics for QC:
-#               * n_taxa: Total number of taxa (including chimeras)
-#               * shannon: Shannon diversity index
-#               * evenness: Pielou's evenness (J)
-#               * n_chimeras: Number of chimeric sequences generated
+#   @return [list] with elements:
+#     - sequences  [DNAStringSet] - Sequences with noise applied
+#     - abundances [named numeric] - Relative abundances (sum to 1.0)
+#     - table      [data.frame]   - OTU table (OTU, abundance, taxonomy)
+#     - metrics    [list]         - n_taxa, shannon, evenness, n_chimeras
 #
-# Dependencies:
-#   - Biostrings (>= 2.60.0) for sequence manipulation
-#   - Config parameters: SIMULATION_* variables control noise models
+# Notes:
+#   Grinder-inspired simulation pipeline (Angly et al. 2012):
+#     1. Random sampling from SILVA without replacement
+#     2. Lognormal SAD (mu=5, sigma=2; Preston 1948) or uniform/powerlaw
+#     3. PCR bias: GC-dependent efficiency compounded over 25 cycles
+#        efficiency = 1 - bias_strength * ((GC - 0.5) / 0.15)^2
+#     4. Illumina errors: 0.3% substitution rate (Schirmer et al. 2015),
+#        position-dependent increase toward 3' end, transition bias (70%)
+#     5. Chimeras: 2% rate, random breakpoint, abundance = sqrt(p1*p2)*0.1
+#        (Haas et al. 2011) -- disabled by default
+#     6. Normalise to relative abundances; report Shannon H' and Pielou's J
 #
-# References:
-#   - Angly FE et al. (2012) Grinder: a versatile amplicon and shotgun 
-#     sequence simulator. Nucleic Acids Res 40(12):e94
-#   - Schirmer M et al. (2015) Insight into biases and sequencing errors for
-#     amplicon sequencing. Nucleic Acids Res 43(6):e37
-#   - Haas BJ et al. (2011) Chimeric 16S rRNA sequence formation and detection
-#     in Sanger and 454-pyrosequenced PCR amplicons. Genome Res 21(3):494-504
-#   - Preston FW (1948) The commonness, and rarity, of species. Ecology 29:254-283
-#
-# Example:
-#   silva <- readDNAStringSet("SILVA_138.2_SSURef_NR99.fasta")
-#   community <- get_community(db_seq = silva, ntaxas = 100, seed = 42)
-#   cat("Generated", community$metrics$n_taxa, "taxa with Shannon =", 
-#       round(community$metrics$shannon, 2))
-#-------------------------------------------------------------------------------
+#   Config variables (SIMULATION_*) control all noise model parameters.
+#   Requires: Biostrings (>= 2.60.0).
+# ------------------------------------------------------------------------------
 
 get_community <- function(db_seq, ntaxas = 100, seed = NULL) {
 
@@ -512,9 +406,11 @@ get_community <- function(db_seq, ntaxas = 100, seed = NULL) {
       0.65
     }
 
+    # Quadratic penalty: sequences far from optimal GC amplify less efficiently
+    # 0.15 is the scaling factor (roughly 1 SD of typical GC distributions)
     gc_deviation <- (gc_content - optimal_gc) / 0.15
     pcr_efficiency <- 1.0 - bias_strength * (gc_deviation ^ 2)
-    pcr_efficiency[pcr_efficiency < 0.1] <- 0.1
+    pcr_efficiency[pcr_efficiency < 0.1] <- 0.1  # Floor at 10% efficiency
 
     # Simulate PCR cycles
     n_cycles <- if(exists("SIMULATION_PCR_CYCLES")) SIMULATION_PCR_CYCLES else 25
@@ -699,8 +595,10 @@ get_community <- function(db_seq, ntaxas = 100, seed = NULL) {
     stringsAsFactors = FALSE
   )
 
-  # Calculate diversity metrics
+  # Calculate diversity metrics for QC validation
+  # Shannon H' = -sum(p_i * ln(p_i)); epsilon avoids log(0)
   shannon <- -sum(abundances * log(abundances + 1e-10))
+  # Pielou's J = H' / H'_max, where H'_max = ln(S)
   evenness <- shannon / log(length(abundances))
 
   message(sprintf("  -> Community generated: %d taxa", length(community_seqs)))
@@ -719,39 +617,27 @@ get_community <- function(db_seq, ntaxas = 100, seed = NULL) {
   )
 }
 
-#-------------------------------------------------------------------------------
-# Function:   get_otu_tab_from_uc
-#-------------------------------------------------------------------------------
-# Description:
-#   Processes a VSEARCH/USEARCH clustering file (`.uc`) to aggregate an OTU
-#   table. It maps query sequences to their centroid (hit) and sums their counts.
-#
-# Scientific Context:
-#   After trimming, sequences that were originally distinct may become identical.
-#   Clustering these trimmed sequences (e.g., at 100% identity with VSEARCH) and
-#   then re-aggregating the OTU table is a crucial step. This function performs
-#   that aggregation, effectively showing how taxonomic units merge and how
-#   community composition changes as a result of trimming.
-#
-# Algorithm:
-#   1. Reads a `.uc` file, which tabulates clustering results.
-#   2. Filters for hits ('H' records), which link a query sequence to a centroid.
-#   3. Cleans sequence identifiers from both the `.uc` file and the OTU table
-#      to ensure consistent matching (removes annotations like `;size=...`).
-#   4. Groups all query OTUs by their target centroid.
-#   5. Sums the counts of all query OTUs that map to the same centroid.
-#   6. Returns a new, smaller OTU table where each row represents a centroid
-#      and its counts are the sum of all member sequences.
+# ------------------------------------------------------------------------------
+# Function: get_otu_tab_from_uc
+# Purpose:  Parses a VSEARCH .uc clustering file and aggregates the OTU table
+#           by summing counts of queries that map to the same centroid.
 #
 # Parameters:
-#   @param otu_table [data.frame] - The pre-clustering OTU table. Must contain
-#          an `OTU` column and numeric sample columns.
-#   @param uc_file [character] - The file path to the `.uc` clustering output.
+#   @param otu_table [data.frame] - Pre-clustering OTU table with OTU column
+#          and numeric sample columns.
+#   @param uc_file   [character]  - Path to the .uc clustering output.
 #
 # Returns:
-#   @return [data.frame|NULL] - The aggregated OTU table, or NULL if the
-#           `.uc` file is missing, empty, or invalid.
-#-------------------------------------------------------------------------------
+#   @return [data.frame|NULL] - Aggregated OTU table (one row per centroid),
+#           or NULL if .uc file is missing/empty/invalid.
+#
+# Notes:
+#   After trimming, originally distinct ASVs may become identical. VSEARCH
+#   clustering groups them; this function sums their counts to show how
+#   taxonomic units merge. Only 'H' (hit) records are used -- these link
+#   each query to its centroid. IDs are cleaned of ;size= annotations
+#   before joining to ensure robust matching.
+# ------------------------------------------------------------------------------
 
 get_otu_tab_from_uc <- function(otu_table, uc_file) {
   # --- Input Validation ---
@@ -846,51 +732,33 @@ get_otu_tab_from_uc <- function(otu_table, uc_file) {
   return(otutable_n)
 }
 
-#===============================================================================
+# ==============================================================================
 # SECTION 4: DATA LOADING & VALIDATION
-#===============================================================================
+# Functions for reading, synchronising, and validating the primary input data
+# (ASV counts tables, FASTA files, taxonomy) specified in the master manifest.
+# ==============================================================================
 
-#-------------------------------------------------------------------------------
-# Function:   sync_data_for_study
-#-------------------------------------------------------------------------------
-# Description:
-#   Loads all necessary data for a single study as defined in the manifest:
-#   the ASV counts table, the ASV FASTA file, and an optional taxonomy file.
-#   It ensures that the IDs across all files are synchronized.
-#
-# Scientific Context:
-#   Reproducible genomic analysis requires that the feature table (counts),
-#   the sequences (FASTA), and their taxonomic assignments are perfectly
-#   aligned. This function enforces that alignment by finding the intersection
-#   of all IDs and subsetting the data accordingly. It also robustly handles
-#   various ways taxonomy might be provided (or not provided).
-#
-# Algorithm:
-#   1. Reads the counts table and FASTA file.
-#   2. Identifies the feature ID column in the counts table, cleaning the
-#      common "#OTU ID" header format.
-#   3. Finds the set of common IDs present in both the table and the FASTA file.
-#      Exits with a fatal error if there is no overlap.
-#   4. Subsets both the table and the sequences to include only the common IDs.
-#   5. Searches for taxonomy information in a prioritized order:
-#      a. An external file specified by `taxonomy_path` in the manifest.
-#      b. An embedded column within the counts table (e.g., a "taxonomy" column).
-#   6. If no taxonomy is found, it creates a placeholder taxonomy using the ASV
-#      IDs themselves, allowing for ASV-level analysis to proceed.
-#   7. Checks if the loaded taxonomy is in a standard, semicolon-separated format,
-#      and reports success or failure.
+# ------------------------------------------------------------------------------
+# Function: sync_data_for_study
+# Purpose:  Loads ASV counts, FASTA sequences, and (optional) taxonomy for a
+#           single study, synchronising IDs across all files.
 #
 # Parameters:
-#   @param job_info [list or data.frame row] - A named list/row containing file
-#          paths for the study: `asv_fasta_path`, `asv_counts_path`, and
-#          optionally `taxonomy_path`.
+#   @param job_info [list/row] - Must contain asv_fasta_path, asv_counts_path;
+#          optionally taxonomy_path.
 #
 # Returns:
-#   @return [list] - A list containing:
-#           - `otu_table`: A tibble with counts and a `taxonomy` column.
-#           - `sequences`: A `BStringSet` synced with the `otu_table`.
-#           - `has_taxonomy`: A boolean indicating if formal taxonomy was loaded.
-#-------------------------------------------------------------------------------
+#   @return [list] with elements:
+#     - otu_table    [tibble]      - Counts with OTU and taxonomy columns.
+#     - sequences    [BStringSet]  - Synced with otu_table row order.
+#     - has_taxonomy [logical]     - TRUE if semicolon-separated taxonomy found.
+#
+# Notes:
+#   Taxonomy is resolved in priority order: (1) external file from manifest,
+#   (2) embedded column in counts table, (3) fallback to ASV IDs as taxonomy.
+#   The "#OTU ID" header common in BIOM exports is cleaned automatically.
+#   Fatal errors are thrown if no overlap exists between table and FASTA IDs.
+# ------------------------------------------------------------------------------
 
 sync_data_for_study <- function(job_info) {
   asv_fasta_path <- job_info$asv_fasta_path
@@ -1002,29 +870,23 @@ sync_data_for_study <- function(job_info) {
   ))
 }
 
-#-------------------------------------------------------------------------------
-# Function:   validate_study_data
-#-------------------------------------------------------------------------------
-# Description:
-#   Performs a "dry run" check of all studies listed in the master manifest. It
-#   verifies the existence of all required input files (FASTA, counts) and
-#   reports the status of optional taxonomy files.
-#
-# Scientific Context:
-#   This health-check function is crucial for preventing pipeline failures
-#   mid-way through a long computation. By validating all file paths upfront,
-#   it allows the user to correct errors in the manifest before submitting
-#   dozens or hundreds of cluster jobs, saving significant time and resources.
+# ------------------------------------------------------------------------------
+# Function: validate_study_data
+# Purpose:  Dry-run validation of all studies in the master manifest. Checks
+#           existence of required files (FASTA, counts) and optional taxonomy.
 #
 # Parameters:
-#   None. Relies on `MASTER_MANIFEST_PATH` being defined in the global environment.
+#   (none) - reads MASTER_MANIFEST_PATH from global environment.
 #
 # Returns:
-#   @return [data.frame] - The manifest tibble with added boolean columns:
-#           `fasta_exists`, `counts_exists`, `taxonomy_specified`,
-#           `taxonomy_exists`, and `ready_for_analysis`. This can be used for
-#           programmatic filtering or reporting.
-#-------------------------------------------------------------------------------
+#   @return [data.frame] - Manifest with added columns: fasta_exists,
+#           counts_exists, taxonomy_specified, taxonomy_exists,
+#           ready_for_analysis. Enables programmatic filtering/reporting.
+#
+# Notes:
+#   Run this before submitting batch jobs to catch path errors upfront,
+#   avoiding mid-pipeline failures on compute clusters.
+# ------------------------------------------------------------------------------
 
 validate_study_data <- function() {
   source("R") # This seems potentially incorrect, might need clarification. Usually `source("path/to/file.R")`.
@@ -1075,48 +937,38 @@ validate_study_data <- function() {
   return(validation_summary)
 }
 
-#===============================================================================
+# ==============================================================================
 # SECTION 5: CORE ANALYTICAL FUNCTIONS
-#===============================================================================
-# This section contains the engines for processing simulation outputs. It transforms
-# raw VSEARCH clustering results (.uc files) into structured OTU tables, calculates
-# ecological metrics (alpha/beta diversity), and identifies statistical thresholds.
-#===============================================================================
+# Engines for processing simulation and real-data outputs. Transforms VSEARCH
+# clustering results into structured OTU tables, computes Bray-Curtis
+# dissimilarity and taxonomic retention across trim steps, and applies
+# changepoint detection (PELT) for threshold identification.
+# ==============================================================================
 
-#-------------------------------------------------------------------------------
-# Function:   analyze_all_taxonomic_levels
-#-------------------------------------------------------------------------------
-# Description:
-#   Iterates through all trimming steps and taxonomic levels to build a complete
-#   dataset of community structure changes.
+# ------------------------------------------------------------------------------
+# Function: analyze_all_taxonomic_levels
+# Purpose:  Iterates through all trim steps and taxonomic levels, parsing .uc
+#           files into aggregated OTU tables with backfilling for missing taxa.
 #
 # Scientific Context:
-#   To understand how trimming affects biological interpretation, we must observe
-#   changes at multiple resolutions (from ASV up to Phylum). This function
-#   reconstructs the community at every step. Crucially, it handles "backfilling":
-#   if a taxon disappears due to trimming (merging into another), it is retained
-#   in the data structure with 0 abundance to ensure that matrices for all steps
-#   have identical dimensions. This is essential for valid time-series analysis.
-#
-# Algorithm:
-#   1. Iterates through each trim step defined in `uc_files`.
-#   2. For each step, parses the VSEARCH .uc file to determine how original
-#      ASVs map to new, trimmed centroids.
-#   3. Aggregates counts:
-#      - For "ASV" level: Sums counts of original ASVs merging into same centroid.
-#      - For taxonomic levels: Uses the taxonomy map to sum counts by rank.
-#   4. Performs Backfilling: Checks against the "Step 0" (untrimmed) table.
-#      Any taxon present at Step 0 but missing at Step N is added back with
-#      0 counts.
+#   To assess trimming effects at multiple resolutions (ASV through Phylum),
+#   this function reconstructs the community at every step. Backfilling
+#   ensures that taxa absent after trimming are retained with 0 abundance,
+#   keeping matrices dimensionally consistent for valid Bray-Curtis comparison.
 #
 # Parameters:
-#   @param otu_table [data.frame] - The original, untrimmed OTU table.
-#   @param uc_files [list] - A list of .uc file paths, indexed by trim step.
+#   @param otu_table [data.frame] - Original untrimmed OTU table with taxonomy.
+#   @param uc_files  [list]       - List of .uc file paths keyed by trim step.
 #
 # Returns:
-#   @return [list] - A nested list structure: `list[[trim_step]][[taxonomic_level]]`
-#           containing the aggregated count tables.
-#-------------------------------------------------------------------------------
+#   @return [list] - Nested: list[[trim_step]][[taxonomic_level]] = count table.
+#
+# Notes:
+#   Algorithm: (1) parse .uc to map ASVs to centroids, (2) aggregate counts
+#   at ASV and each taxonomic rank using taxonomy_map, (3) backfill missing
+#   taxa with 0 counts against step "0" reference. Taxonomy prefix removal
+#   (e.g., "g__") handles both QIIME2 and SILVA naming conventions.
+# ------------------------------------------------------------------------------
 
 analyze_all_taxonomic_levels <- function(otu_table, uc_files) {
   # Add "ASV" to the list of levels to be processed
@@ -1355,20 +1207,18 @@ analyze_all_taxonomic_levels <- function(otu_table, uc_files) {
   return(otu_tables_per_level)
 } # Closes the function definition
 
-#-------------------------------------------------------------------------------
-# Function:   calculate_max_valid_trim
-#-------------------------------------------------------------------------------
-# Description:
-#   Helper function to determine the deepest trimming step that successfully
-#   produced data.
+# ------------------------------------------------------------------------------
+# Function: calculate_max_valid_trim
+# Purpose:  Determines the deepest trim step that produced non-NULL data.
 #
 # Parameters:
-#   @param otu_tables_per_level [list] - The aggregated data structure.
-#   @param increment [numeric] - Size of each trimming step (bp).
+#   @param otu_tables_per_level [list]    - Aggregated data structure.
+#   @param increment            [numeric] - Step size in bp (default from config).
 #
 # Returns:
-#   @return [numeric] - The maximum trim step number (e.g., 30 for 300bp).
-#-------------------------------------------------------------------------------
+#   @return [numeric] - Maximum trim step number (e.g., 30 for 300bp at 10bp
+#           increments). Returns 0 if no valid data exists.
+# ------------------------------------------------------------------------------
 
 calculate_max_valid_trim <- function(otu_tables_per_level, increment = NULL) {
     if (is.null(increment)) {
@@ -1387,38 +1237,26 @@ calculate_max_valid_trim <- function(otu_tables_per_level, increment = NULL) {
     return(max_trim_step)
 }
 
-#-------------------------------------------------------------------------------
-# Function:   calculate_dissimilarity_over_trims
-#-------------------------------------------------------------------------------
-# Description:
-#   Calculates the Bray-Curtis dissimilarity between the baseline (Step 0)
-#   community and the community at each trimming step.
-#
-# Scientific Context:
-#   This is the core metric of SeCAT. By quantifying how much the community
-#   composition deviates from the "ground truth" (Step 0) as sequences are
-#   shortened, we can build a degradation curve. The "null model" and "degradation
-#   point" are subsequently derived from this curve.
-#
-# Critical Logic:
-#   - Proper Alignment: Uses row names to align the baseline and trimmed matrices.
-#     This ensures that we are comparing the abundance of Taxon A in the baseline
-#     to Taxon A in the trimmed data, not relying on row order (which changes).
-#   - Metric: Bray-Curtis dissimilarity is used as it accounts for both presence/
-#     absence and abundance, and is standard in microbial ecology (0 = identical,
-#     1 = completely different).
+# ------------------------------------------------------------------------------
+# Function: calculate_dissimilarity
+# Purpose:  Computes Bray-Curtis dissimilarity between the baseline (step 0)
+#           community and the community at each successive trim step.
 #
 # Parameters:
-#   @param otu_tables_per_level [list] - The data structure from analyze_all...
-#   @param num_steps [integer] - Total number of trim steps to analyze.
+#   @param otu_tables_per_level [list]    - From analyze_all_taxonomic_levels().
+#   @param num_steps            [integer] - Total trim steps to analyse.
+#   @param increment            [numeric] - Step size in bp (default 10).
 #
 # Returns:
-#   @return [data.frame] - A tibble with columns `Level`, `Trim_BP`, `Dissimilarity`.
-#-------------------------------------------------------------------------------
-
-#-------------------------------------------------------------------------------
-# Function:   calculate_dissimilarity
-#-------------------------------------------------------------------------------
+#   @return [tibble] - Columns: Level, Trim_BP, Dissimilarity, mode.
+#
+# Notes:
+#   This is the core metric of SeCAT. Matrices are aligned by taxon name
+#   (not row order) before computing Bray-Curtis via vegan::vegdist.
+#   For samples with fewer than 2 non-zero taxa, a simple Jaccard-like
+#   overlap is used as fallback. Once dissimilarity reaches ~1.0, all
+#   subsequent steps are set to 1.0 (total community loss).
+# ------------------------------------------------------------------------------
 calculate_dissimilarity <- function(otu_tables_per_level, num_steps, increment = 10) {
 
   dissimilarity_results <- list()
@@ -1557,21 +1395,19 @@ calculate_dissimilarity <- function(otu_tables_per_level, num_steps, increment =
     dplyr::arrange(Level, Trim_BP)
 }
 
-#-------------------------------------------------------------------------------
-# Function:   calculate_taxonomic_retention
-#-------------------------------------------------------------------------------
-# Description:
-#   Calculates the percentage of original taxa retained at each trimming step.
-#   Unlike diversity (which accounts for abundance), this is a simple presence/
-#   absence metric.
+# ------------------------------------------------------------------------------
+# Function: calculate_taxonomic_retention
+# Purpose:  Calculates the percentage of original taxa (presence/absence)
+#           retained at each trim step. Complements abundance-based Bray-Curtis.
 #
 # Parameters:
-#   @param otu_tables_per_level [list] - Aggregated data structure.
-#   @param num_steps [integer] - Total steps.
+#   @param otu_tables_per_level [list]    - Aggregated data structure.
+#   @param num_steps            [integer] - Total trim steps.
+#   @param increment            [numeric] - Step size in bp (default 10).
 #
 # Returns:
-#   @return [data.frame] - Columns: `Level`, `Trim_BP`, `Retention` (%).
-#-------------------------------------------------------------------------------
+#   @return [tibble] - Columns: Level, TrimStep, Trim_BP, Retention (%), mode.
+# ------------------------------------------------------------------------------
 
 calculate_taxonomic_retention <- function(otu_tables_per_level, num_steps, increment = 10) {
   
@@ -1634,26 +1470,25 @@ calculate_taxonomic_retention <- function(otu_tables_per_level, num_steps, incre
   dplyr::bind_rows(all_retention)
 }
 
-#-------------------------------------------------------------------------------
-# Function:   calculate_changepoint_thresholds
-#-------------------------------------------------------------------------------
-# Description:
-#   Identifies significant "tipping points" in the dissimilarity curve using
-#   Changepoint Analysis (PELT method).
-#
-# Scientific Context:
-#   Visual inspection of degradation curves is subjective. This function uses a
-#   rigorous statistical approach (Pruned Exact Linear Time) to detect changes
-#   in the mean and variance of the dissimilarity signal. The first significant
-#   changepoint often indicates the trim depth where information loss accelerates.
+# ------------------------------------------------------------------------------
+# Function: calculate_changepoint_thresholds
+# Purpose:  Detects tipping points in the dissimilarity curve using the PELT
+#           (Pruned Exact Linear Time) changepoint algorithm.
 #
 # Parameters:
-#   @param dissim_data [data.frame] - Output from calculate_dissimilarity...
-#   Global Configs used: CHANGEPOINT_PENALTY_METHOD, CHANGEPOINT_PENALTY_MULTIPLIER.
+#   @param dissim_data [data.frame] - Output from calculate_dissimilarity().
+#          Also reads CHANGEPOINT_PENALTY_METHOD and
+#          CHANGEPOINT_PENALTY_MULTIPLIER from global env.
 #
 # Returns:
-#   @return [data.frame] - `Level`, `threshold_bp` (the identified changepoint).
-#-------------------------------------------------------------------------------
+#   @return [tibble] - Columns: Level, threshold_bp.
+#
+# Notes:
+#   Uses changepoint::cpt.meanvar with PELT to detect simultaneous shifts in
+#   mean and variance. The penalty controls sensitivity: SIC (default) = BIC =
+#   log(n), AIC = 2, MANUAL = user-specified. The first changepoint typically
+#   marks where information loss accelerates.
+# ------------------------------------------------------------------------------
 
 calculate_changepoint_thresholds <- function(dissim_data) {
   penalty_method <- if (exists("CHANGEPOINT_PENALTY_METHOD")) toupper(CHANGEPOINT_PENALTY_METHOD) else "SIC"
@@ -1698,21 +1533,26 @@ calculate_changepoint_thresholds <- function(dissim_data) {
     )
 }
 
-#-------------------------------------------------------------------------------
-# Function:   analyze_taxon_impact
-#-------------------------------------------------------------------------------
-# Description:
-#   Tracks the relative abundance of all taxa across the entire trimming series.
+# ------------------------------------------------------------------------------
+# Function: analyze_taxon_impact
+# Purpose:  Tracks relative abundance of every taxon across the full trimming
+#           series, enabling per-taxon trajectory plots.
 #
-# Scientific Context:
-#   While diversity metrics provide a high-level view of degradation, they don't
-#   tell us *which* organisms are being lost. This function generates the raw data
-#   needed to plot the trajectories of individual taxa (e.g., "Does E. coli
-#   disappear at 200bp?"). This allows for biologically specific quality control.
+# Parameters:
+#   @param otu_tables_per_level    [list]    - Aggregated data structure.
+#   @param num_steps               [integer] - Total trim steps.
+#   @param increment               [numeric] - Step size in bp (default 10).
+#   @param min_abundance_threshold [numeric] - Reserved for future filtering.
 #
 # Returns:
-#   @return [list] - Containing `impacted_taxa` (long format tibble of abundances).
-#-------------------------------------------------------------------------------
+#   @return [list] with elements:
+#     - impacted_taxa [tibble] - Long format: Taxon, Abundance, Level, Trim_BP.
+#     - core_taxa     [tibble] - Placeholder for future use.
+#
+# Notes:
+#   Abundances are normalised per-sample (column sums) then averaged across
+#   samples. Missing trim steps record 0 abundance for all baseline taxa.
+# ------------------------------------------------------------------------------
 
 analyze_taxon_impact <- function(otu_tables_per_level, num_steps, increment = 10, min_abundance_threshold = 0.001) {
 
@@ -1792,22 +1632,27 @@ analyze_taxon_impact <- function(otu_tables_per_level, num_steps, increment = 10
     ))
 }
 
-#-------------------------------------------------------------------------------
-# Function:   analyze_core_taxa
-#-------------------------------------------------------------------------------
-# Description:
-#   Identifies "core" taxa (those with high prevalence at baseline) and retrieves
-#   their statistics for specialized reporting.
+# ------------------------------------------------------------------------------
+# Function: analyze_core_taxa
+# Purpose:  Identifies high-prevalence ("core") taxa at baseline and tracks
+#           their abundance across all trim steps for specialised reporting.
 #
 # Parameters:
-#   @param prevalence_threshold [numeric] - Fraction of samples a taxon must
-#          appear in to be considered "core" (e.g., 0.5).
-#   @param top_n [integer] - Maximum number of core taxa to report per level.
+#   @param otu_tables_per_level [list]    - Aggregated data structure.
+#   @param prevalence_threshold [numeric] - Fraction of samples required for
+#          "core" status (default 0.75).
+#   @param top_n                [integer] - Max core taxa to report per level
+#          (default 10), ranked by mean relative abundance.
 #
 # Returns:
-#   @return [list] - A list of data frames (one per level) containing stats for
-#           the top core taxa.
-#-------------------------------------------------------------------------------
+#   @return [tibble|NULL] - Long format: Taxon, Abundance, Level, Trim_BP.
+#           NULL if no baseline data or no taxa meet the threshold.
+#
+# Notes:
+#   Core taxa are defined at step 0, then their trajectories are followed
+#   through all trim steps. Missing taxa at a given step are recorded with
+#   abundance 0 to ensure plot continuity.
+# ------------------------------------------------------------------------------
 analyze_core_taxa <- function(otu_tables_per_level, prevalence_threshold = 0.75, top_n = 10) {
 
   # Helper to get levels safely
@@ -1903,13 +1748,20 @@ analyze_core_taxa <- function(otu_tables_per_level, prevalence_threshold = 0.75,
 }
 
 
-#-------------------------------------------------------------------------------
-# Function:   cut_sequence
-#-------------------------------------------------------------------------------
-# Description:
-#   Physically trims DNA sequences by a fixed number of bases from the head
-#   and/or tail.
-#-------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# Function: cut_sequence
+# Purpose:  Physically trims DNA sequences by removing a fixed number of bases
+#           from the 5' (head) and/or 3' (tail) ends.
+#
+# Parameters:
+#   @param seq  [BStringSet/DNAStringSet] - Sequences to trim.
+#   @param head [integer] - Bases to remove from 5' end (default 0).
+#   @param tail [integer] - Bases to remove from 3' end (default 0).
+#
+# Returns:
+#   @return [BStringSet] - Trimmed sequences; empty strings for sequences
+#           shorter than head + tail.
+# ------------------------------------------------------------------------------
 
 cut_sequence <- function(seq, head = 0, tail = 0){
   char_seq <- as.character(seq)
@@ -1924,85 +1776,85 @@ cut_sequence <- function(seq, head = 0, tail = 0){
   return(x2)
 }
 
-#-------------------------------------------------------------------------------
-# Function:   run_vsearch
-#-------------------------------------------------------------------------------
-# Description:
-#   Wrapper for the VSEARCH command-line tool. Performs de novo clustering
-#   (`--cluster_size`) on a FASTA file.
-#-------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# Function: run_vsearch
+# Purpose:  Wrapper for VSEARCH de novo clustering (--cluster_size).
+#
+# Parameters:
+#   @param fasta        [character] - Input FASTA path.
+#   @param out          [character] - Output prefix (produces .uc and .fasta).
+#   @param vsearch_path [character] - Path to vsearch executable.
+#   @param identity     [numeric]   - Clustering identity threshold (default 0.97).
+#   @param strand       [character] - Strand search mode (default "both").
+#
+# Returns:
+#   (side effect) - Writes .uc and .fasta centroid files to disk.
+# ------------------------------------------------------------------------------
 
 run_vsearch <- function(fasta, out, vsearch_path, identity = 0.97, strand = "both"){
   cmd <- sprintf('%s --cluster_size "%s" --id %s --uc "%s.uc" --strand %s --centroids "%s.fasta" --threads 1', vsearch_path, fasta, identity, out, strand, out)
   system(cmd, ignore.stdout = TRUE, ignore.stderr = TRUE)
 }
 
-#-------------------------------------------------------------------------------
-# Function:   perform_consensus_trim
-#-------------------------------------------------------------------------------
-# Description:
-#   Placeholder for consensus trimming logic. Currently returns sequences as-is.
-#   (Likely reserved for future implementation of coverage-based trimming).
-#-------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# Function: perform_consensus_trim
+# Purpose:  Placeholder for coverage-based consensus trimming. Currently a
+#           no-op that returns sequences unchanged.
+#
+# Parameters:
+#   @param sequences       [DNAStringSet] - Input sequences.
+#   @param consensus_start [integer]      - Start of consensus region.
+#   @param consensus_end   [integer]      - End of consensus region.
+#   @param min_coverage    [numeric]      - Minimum coverage fraction (default 0.5).
+#
+# Returns:
+#   @return [DNAStringSet] - Sequences (currently unmodified).
+# ------------------------------------------------------------------------------
 perform_consensus_trim <- function(sequences, consensus_start, consensus_end, min_coverage = 0.5) {
   return(sequences)
 }
 
-#===============================================================================
+# ==============================================================================
 # SECTION 6: SIMULATION ENGINE
-#===============================================================================
+# The core trim-and-recluster loop. Progressively shortens sequences, re-maps
+# them to fixed reference centroids via VSEARCH, and records which OTUs merge
+# at each trim depth.
+# ==============================================================================
 
-#-------------------------------------------------------------------------------
-# Function:   run_trim_analysis
-#-------------------------------------------------------------------------------
-# Description:
-#   The core simulation engine of SeCAT. It performs "in silico" trimming of
-#   sequences to simulate the loss of information that occurs with shorter
-#   amplicons.
-#
-# Scientific Context:
-#   To objectively determine the minimum informative length of an amplicon, we
-#   must simulate the sequencing process. This function takes "full-length"
-#   sequences (or a predefined study window) and progressively shortens them.
-#   At each step, it re-clusters the sequences using VSEARCH. This allows us
-#   to observe when distinct OTUs "collapse" into one another due to sequence
-#   identity, quantifying the loss of resolution.
-#
-# Modes:
-#   - Study Mode (use_alignment = TRUE): Uses a Multiple Sequence Alignment (MSA)
-#     to define a "Study Window". Trimming effectively narrows this window. This
-#     is robust for indel-rich regions.
-#   - Primer Mode (use_alignment = FALSE): Physically cuts base pairs from the
-#     5' and 3' ends. Useful for raw primer evaluation.
-#
-# Algorithm:
-#   1. Define Reference Centroids:
-#      - Clusters the full-length (or study window) sequences at 97% identity.
-#      - These centroids represent the "Ground Truth" OTUs.
-#   2. Baseline Mapping (Step 0):
-#      - Maps the original sequences to these centroids to establish the
-#        perfect-match baseline.
-#   3. Trimming Loop:
-#      - For each step (e.g., 10bp, 20bp...):
-#      - Trims the sequences (by slicing MSA or cutting string).
-#      - Writes trimmed sequences to a temp file.
-#      - Maps trimmed sequences back to the *original* Reference Centroids.
-#   4. Output:
-#      - Generates a .uc file for each step, recording which centroid each
-#        trimmed sequence maps to.
+# ------------------------------------------------------------------------------
+# Function: run_trim_analysis
+# Purpose:  Core simulation engine. Progressively trims sequences in silico,
+#           re-maps them to fixed reference centroids via VSEARCH, and records
+#           OTU merging at each depth.
 #
 # Parameters:
-#   @param sequences [DNAStringSet] - Raw sequences.
-#   @param vsearch_path [character] - Path to vsearch executable.
-#   @param output_dir [character] - Directory for temp files and results.
-#   @param mode [character] - "both" (trims from both ends proportionally).
-#   @param use_alignment [logical] - Whether to use MSA-based trimming.
-#   @param aligned_sequences [DNAStringSet] - The MSA (required if use_alignment=T).
+#   @param sequences          [DNAStringSet] - Raw sequences.
+#   @param vsearch_path       [character]    - Path to vsearch executable.
+#   @param output_dir         [character]    - Directory for temp files/results.
+#   @param num_steps          [integer]      - Number of trim steps (default 30).
+#   @param mode               [character]    - "both" = proportional from each end.
+#   @param increment          [numeric]      - Step size in bp (default 10).
+#   @param primer_start/end   [integer|NULL] - Primer boundaries in alignment.
+#   @param consensus_start/end [integer|NULL] - Consensus region boundaries.
+#   @param use_alignment      [logical]      - TRUE = MSA slicing (Study Mode);
+#          FALSE = physical bp cutting (Primer Mode).
+#   @param aligned_sequences  [DNAStringSet] - MSA (required if use_alignment=TRUE).
 #
 # Returns:
-#   @return [list] - Contains `uc_files` (list of paths to result files) and
-#           metadata about the trimming process.
-#-------------------------------------------------------------------------------
+#   @return [list] with elements:
+#     - uc_files              [list]    - Paths to .uc files keyed by trim_bp.
+#     - total_trim_to_consensus [numeric] - Total distance to consensus region.
+#     - head_proportion       [numeric] - Fraction of trim applied to 5' end.
+#
+# Notes:
+#   Study Mode: slices MSA columns to narrow the study window; robust for
+#   indel-rich regions. Primer Mode: physically removes characters from
+#   sequence strings. In both modes, reference centroids are established once
+#   at 97% identity (step 0), then trimmed queries AND references are mapped
+#   at each step. Sequences shorter than 50bp are filtered out.
+#   Proportional trimming biases cuts toward whichever end is farther from
+#   the consensus region.
+# ------------------------------------------------------------------------------
 
 run_trim_analysis <- function(sequences, vsearch_path, output_dir, num_steps = 30, mode = "both", increment = 10,
                               primer_start = NULL, primer_end = NULL, consensus_start = NULL, consensus_end = NULL,

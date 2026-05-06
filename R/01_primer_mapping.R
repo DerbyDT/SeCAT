@@ -1,35 +1,37 @@
 #!/usr/bin/env Rscript
-#===============================================================================
-# SCRIPT:   scripts/01_primer_mapping.R
-# PIPELINE: SeCAT (Sequence Consensus Analysis Tool)
-# PHASE:    Phase 1: Primer Coordinate Mapping
-# VERSION:  3.0 (Config-driven)
-# AUTHOR:   [Author Name]
+# ==============================================================================
+# SCRIPT:   01_primer_mapping.R
+# PIPELINE: SeCAT v4.1 (Sequence Consensus Amplicon Trimming)
+# STAGE:    Stage 1 — Primer Coordinate Mapping (Primer Mode Only)
+# PURPOSE:  Map each primer pair to SILVA reference alignment coordinates.
 #
-# PURPOSE:
-#   Determines the physical genomic coordinates for every primer set listed in
-#   the master manifest by aligning them to the full reference database.
-#
-# BIOLOGICAL RATIONALE:
-#   To perform a meta-analysis across studies with different primer sets (e.g.,
-#   V3-V4 vs V4), we must first identify the "Consensus Region"—the shared
-#   intersection of all amplicons. This script maps every primer to a canonical
-#   reference (e.g., SILVA/GreenGenes) to find these start/end positions.
-#   This defines the maximum possible window for the subsequent analysis.
+# OVERVIEW:
+#   To harmonise amplicon datasets generated with different primer pairs
+#   (e.g., 515F/806R targeting V4 vs 341F/785R targeting V3-V4), SeCAT must
+#   first determine where each primer's amplicon falls within a common
+#   reference coordinate space (SILVA 138). This script aligns every unique
+#   primer pair from the manifest to the full SILVA reference and records the
+#   start/end positions. These coordinates define the theoretical amplicon
+#   boundaries and are used downstream to calculate the consensus region —
+#   the maximal 16S window shared across all included studies.
 #
 # INPUTS:
-#   - Manifest: [SECAT_MANIFEST_PATH] (TSV with `primer_name`, `fwd_seq`, `rev_seq`)
-#   - Reference DB: [REFERENCE_DB_PATH] (FASTA, e.g., SILVA 138)
+#   - SECAT_MANIFEST_PATH: TSV with columns primer_name, fwd_seq, rev_seq
+#   - REFERENCE_DB_PATH: full SILVA aligned FASTA (NR99)
 #
 # OUTPUTS:
-#   - File: output/intermediate/primer_coords_phase1_output.csv
-#   - Format: CSV with columns `primer_name`, `primer_start`, `primer_end`
+#   - output/intermediate/primer_coords_phase1_output.csv
+#     Columns: primer_name, primer_start, primer_end (SILVA positions)
 #
 # DEPENDENCIES:
-#   - R/secat_consensus.R: Contains `find_consensus_region()` logic.
-#   - R/secat_config.R: Global paths and constants.
+#   - R/secat_config.R: global paths and constants
+#   - R/secat_utils.R: general utility functions
+#   - R/secat_consensus.R: find_consensus_region() alignment logic
 #
-#===============================================================================
+# CALLED BY:
+#   - modules/local/primer_mapping.nf (PRIMER_MAPPING process)
+#   - Only used when analysis_mode = "primer"
+# ==============================================================================
 
 #===============================================================================
 # SECTION 1: INITIALIZATION

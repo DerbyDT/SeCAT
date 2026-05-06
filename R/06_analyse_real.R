@@ -1,9 +1,49 @@
 #!/usr/bin/env Rscript
-#===============================================================================
-# SCRIPT:   scripts/06_analyse_real.R
-# PIPELINE: SeCAT (Sequence Consensus Analysis Tool)
-# PHASE:    Phase 4: Real Data Analysis (Resolution Modes)
-#===============================================================================
+# ==============================================================================
+# SCRIPT:   06_analyse_real.R
+# PIPELINE: SeCAT v4.1 (Sequence Consensus Amplicon Trimming)
+# STAGE:    Stage 6 — Real Data Trimming Analysis (Worker)
+# PURPOSE:  Progressively trim one study's sequences and measure beta-diversity
+#           degradation at each step to build the real degradation curve.
+#
+# OVERVIEW:
+#   This is the empirical counterpart to the simulation worker (05_sim_worker.R).
+#   For a single study, it:
+#     1. Loads the study's aligned ASV sequences and feature table
+#     2. Determines the number of trim steps needed to reach (and pass) the
+#        consensus region boundary
+#     3. At each step, trims sequences from the amplicon edges inward, re-
+#        clusters with VSEARCH, and computes Bray-Curtis dissimilarity relative
+#        to the untrimmed baseline
+#     4. Identifies changepoints (PELT) in the degradation curve
+#     5. Tracks taxonomic retention and core taxa dynamics
+#
+#   The resulting degradation curves are compared against simulation null
+#   distributions in 07_aggregate.R to determine whether the study can be
+#   safely trimmed to the consensus region.
+#
+# INPUTS:
+#   - Command-line argument: study_name (string)
+#   - SECAT_MANIFEST_PATH: cleaned manifest TSV
+#   - output/intermediate/study_alignment_coords.csv (study coordinates)
+#   - output/intermediate/aligned_fastas/<study>_aligned.fasta
+#   - output/intermediate/consensusregioninfo.csv (consensus boundaries)
+#
+# OUTPUTS:
+#   - output/real_data_results/<study>/<study>_results.rds
+#     (list containing: dissimilarity curves, retention data, changepoints,
+#      OTU tables per taxonomic level, taxon impact analysis, trim metadata)
+#
+# DEPENDENCIES:
+#   - R/secat_config.R: global paths and configuration
+#   - R/secat_utils.R: run_trim_analysis(), calculate_dissimilarity(),
+#     calculate_taxonomic_retention(), calculate_changepoint_thresholds(),
+#     analyze_core_taxa(), analyze_taxon_impact(), sync_data_for_study()
+#   - R/secat_consensus.R: find_largest_overlapping_clique()
+#
+# CALLED BY:
+#   - modules/local/analyse_real.nf (ANALYSE_REAL process)
+# ==============================================================================
 
 #===============================================================================
 # SECTION 1: SETUP

@@ -1,29 +1,89 @@
 #!/usr/bin/env Rscript
 # ==============================================================================
-# SeCAT VALIDATION SCRIPT v4.0
-# ==============================================================================
-# Purpose: Multi-tier ecological and sequence-level validation of consensus-
-#          trimmed amplicon datasets. Compares pre-trim (unaligned_cleaned/)
-#          with post-trim (aligned_trimmed/) outputs at ASV, Genus, and Family
-#          resolution.
+# SCRIPT:   validation_taxon_v2.R
+# PIPELINE: SeCAT v4.1 (Sequence Consensus Amplicon Trimming)
+# STAGE:    Stage 11 -- Multi-Tier Ecological Validation
+# PURPOSE:  Validate the harmonised (merged) dataset by comparing pre- and
+#           post-trimming community structure across multiple ecological metrics.
 #
-# Tiers:
-#   0  - Sequence-level QC (lengths, GC content, coordinate verification)
-#   1A - Alpha diversity preservation (ICC, Spearman, Bland-Altman)
-#   1B - Beta diversity preservation (Mantel, Procrustes, PERMANOVA delta)
-#   1C - Within-group dispersion (betadisper / Levene)
-#   1D - Rank abundance curve preservation
-#   2A - Cross-study MetaASV sharing (ASV level) / taxon overlap (Genus/Family)
-#   3A - Taxonomic composition bar plots
-#   3B - Co-occurrence network stability (topology + hub node preservation)
-#   4  - Abundance concordance (Spearman per-taxon, NOT DESeq2)
+# OVERVIEW:
+#   After trimming and merging, this script assesses whether the harmonisation
+#   preserved the ecological signal of the original datasets. It runs a
+#   multi-tier validation at each requested taxonomic level (ASV, Genus, Family):
 #
-# Author: SeCAT Development Team
-# Version: 4.0 (2026-03)
+#   Tier 0:  Sequence-level QC -- length distributions, GC content stability,
+#            and consensus coordinate verification against trim_summary.csv.
+#   Tier 1A: Alpha diversity preservation -- ICC (two-way agreement), Spearman
+#            rank correlation, and Bland-Altman agreement plots for Observed
+#            richness, Chao1, ACE, Shannon, Simpson, and Pielou evenness.
+#   Tier 1B: Beta diversity preservation -- Mantel test (Pearson on Bray-Curtis
+#            distance matrices), Procrustes/PROTEST rotation analysis, and
+#            delta-R2 PERMANOVA comparing study-level variance before/after.
+#   Tier 1C: Within-group dispersion -- betadisper (Levene analogue for
+#            multivariate data) tests whether trimming shifts within-study
+#            variance in ordination space.
+#   Tier 1D: Rank abundance curve preservation -- per-sample Spearman rho on
+#            sorted relative abundances; tests dominance gradient stability.
+#   Tier 2A: Cross-study feature sharing -- MetaASV sharing rate at ASV level
+#            (via asv_mapping_final.tsv), pairwise Jaccard at Genus/Family.
+#   Tier 3A: Taxonomic composition -- stacked bar plots of top-10 taxa with
+#            consistent colour palette across before/after panels.
+#   Tier 3B: Co-occurrence network stability -- topology metrics (vertices,
+#            edges, density, transitivity), hub node retention (top 10% by
+#            degree), and optional meconetcomp robustness analysis.
+#   Tier 4:  Abundance concordance -- per-taxon Spearman rho across samples
+#            (replaces DESeq2). Uses MetaASV bridge at ASV level.
+#
+#   Results are saved as CSV tables and PDF plots in the validation output
+#   directory. These provide evidence for thesis examiners and reviewers that
+#   SeCAT's trimming did not introduce systematic bias.
+#
+# INPUTS:
+#   - Post-trimming: feature_table.tsv, taxonomy.tsv, metadata.tsv,
+#     sequences.fasta (in post_consensus/)
+#   - Pre-trimming: matching tables in pre_consensus/
+#   - ASV mapping (asv_mapping_final.tsv -- old-to-new ASV ID correspondence)
+#   - Consensus region info and trim summary CSVs from pipeline output
+#
+# OUTPUTS:
+#   - outputs/ directory: validation_summary.csv, per-tier CSVs, per-level
+#     subdirectories with detailed results
+#   - outputs/figures/ directory: PDF diagnostic plots per tier and level
+#   - outputs/checkpoints/ directory: RDS checkpoints for resumable runs
+#
+# DEPENDENCIES:
+#   - vegan:      diversity indices, PERMANOVA (adonis2), Mantel, betadisper,
+#                 PCoA (cmdscale), Procrustes/PROTEST
+#   - irr:        intraclass correlation coefficient (ICC)
+#   - ggplot2:    all diagnostic visualisations
+#   - patchwork:  multi-panel plot assembly
+#   - microeco:   microtable objects, trans_beta, trans_abund, trans_network
+#   - igraph:     co-occurrence network topology metrics
+#   - ape:        phylogenetic utilities (cmdscale wrapper)
+#   - Biostrings: (optional) sequence length and GC content analysis
+#   - meconetcomp:(optional) network comparison, robustness, Venn diagrams
+#
+# CALLED BY:
+#   - modules/local/validate.nf (VALIDATE process in Nextflow pipeline)
+#
+# USAGE:
+#   Rscript validation_taxon_v2.R [START_TIER] [INSTALL_PACKAGES]
+#   Rscript validation_taxon_v2.R /path/to/base START_TIER INSTALL_PACKAGES
+#
+# Author:  SeCAT Development Team
+# Version: 4.1 (2026-04)
 # ==============================================================================
 
 # ==============================================================================
 # ARGUMENT PARSING
+# ------------------------------------------------------------------------------
+# Supports three calling conventions:
+#   0 args: run from current directory, start at Tier 0, auto-install packages
+#   1 arg:  specify START_TIER (integer) to resume from a specific validation tier
+#   2 args: START_TIER + INSTALL_PACKAGES (logical, FALSE to skip installs)
+#   3 args: BASE_DIR + START_TIER + INSTALL_PACKAGES (full control)
+# The checkpoint system (see save_checkpoint/load_checkpoint below) allows
+# resuming from any tier without re-loading data.
 # ==============================================================================
 
 args <- commandArgs(trailingOnly = TRUE)
@@ -57,6 +117,10 @@ cat("===========================================================================
 
 # ==============================================================================
 # PACKAGE MANAGEMENT
+# ------------------------------------------------------------------------------
+# Checks for all required and optional packages, installing missing ones from
+# CRAN or Bioconductor as needed. Uses a user-local library path to avoid
+# permission issues in shared/container environments.
 # ==============================================================================
 
 options(repos = c(CRAN = "https://cloud.r-project.org"))
@@ -66,6 +130,12 @@ lib_path <- Sys.getenv("R_LIBS_USER", "~/R/library/4.3")
 dir.create(lib_path, recursive = TRUE, showWarnings = FALSE)
 .libPaths(c(lib_path, .libPaths()))
 
+# check_and_install()
+# Purpose:    Test whether a package is available; install if missing and allowed.
+# Parameters: pkg      -- package name (string)
+#             method   -- "CRAN" or "Bioconductor" (install source)
+#             required -- if TRUE, missing package causes pipeline failure
+# Returns:    TRUE if package is now available, FALSE otherwise
 check_and_install <- function(pkg, method = "CRAN", required = TRUE) {
   if (requireNamespace(pkg, quietly = TRUE)) {
     cat(sprintf("  ✓ %-22s [OK]\n", pkg)); return(TRUE)
@@ -94,6 +164,8 @@ check_and_install <- function(pkg, method = "CRAN", required = TRUE) {
   })
 }
 
+# Install/verify all dependencies. Required packages cause fatal error if
+# missing; optional packages (Biostrings, meconetcomp) degrade gracefully.
 cat("Checking packages:\n")
 ok <- TRUE
 ok <- check_and_install("tidyverse", required = FALSE)   && ok
@@ -134,6 +206,9 @@ suppressPackageStartupMessages(library(tibble))
   library(parallel)
 })
 
+# Feature flags for optional packages -- enables graceful degradation
+# Biostrings: needed for Tier 0A/0B (sequence length and GC content analysis)
+# meconetcomp: needed for extended network comparison in Tier 3B
 HAS_BIOSTRINGS    <- requireNamespace("Biostrings",   quietly = TRUE)
 HAS_MECONETCOMP   <- requireNamespace("meconetcomp",  quietly = TRUE)
 if (HAS_BIOSTRINGS)  suppressPackageStartupMessages(library(Biostrings))
@@ -141,6 +216,21 @@ if (HAS_MECONETCOMP) suppressPackageStartupMessages(library(meconetcomp))
 
 # ==============================================================================
 # PATHS
+# ------------------------------------------------------------------------------
+# Directory layout expected by this script:
+#   BASE_DIR/
+#     pre_consensus/          -- original (untrimmed) study data
+#       feature_table.tsv     -- ASV count matrix (features x samples)
+#       taxonomy.tsv          -- QIIME2-style taxonomy (ASV_ID, Taxon, Confidence)
+#       metadata.tsv          -- sample metadata with SampleID and StudyID columns
+#       sequences.fasta       -- (optional) representative sequences
+#     post_consensus/         -- SeCAT-trimmed and merged data (same file formats)
+#     asv_mapping_final.tsv   -- maps original ASV hashes to MetaASV IDs
+#     output/intermediate/    -- consensusregioninfo.csv (from alignment stage)
+#     output/standardized_datasets/ -- trim_summary.csv (from trimming stage)
+#     outputs/                -- validation results written here
+#       figures/              -- PDF plots
+#       checkpoints/          -- RDS checkpoints for resumable runs
 # ==============================================================================
 
 PRE_CONSENSUS_DIR  <- file.path(BASE_DIR, "pre_consensus")
@@ -160,6 +250,9 @@ CONSENSUS_INFO <- file.path(BASE_DIR, "output/intermediate/consensusregioninfo.c
 TRIM_SUMMARY   <- file.path(BASE_DIR, "output/standardized_datasets/trim_summary.csv")
 ASV_MAPPING    <- file.path(BASE_DIR, "asv_mapping_final.tsv")
 
+# Taxonomic resolution levels for the validation loop. Override via environment
+# variable SECAT_VALIDATION_LEVELS (comma-separated, e.g., "ASV,Genus").
+# Default: ASV, Genus, Family -- covers fine-grained through coarse resolution.
 TAXONOMIC_LEVELS <- {
   env_levels <- Sys.getenv("SECAT_VALIDATION_LEVELS", "")
   if (nchar(env_levels) > 0) {
@@ -185,9 +278,19 @@ cat("CPU cores available:", ncores, "\n\n")
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
-# Data loading
+# Data loading helpers
 # ------------------------------------------------------------------------------
 
+# load_otu_table()
+# Purpose:    Read a QIIME2-style feature table (TSV), handling both
+#             feature-by-sample and sample-by-feature orientations.
+# Parameters: filepath -- path to the TSV file
+# Returns:    data.frame with features as rows, samples as columns, numeric
+#             counts. Zero-sum features are removed. Missing/duplicate IDs
+#             are cleaned automatically.
+# Notes:      Auto-detects orientation by checking whether the first column
+#             header matches known feature ID names (e.g., "#OTU ID",
+#             "Feature ID"). If not, assumes sample-by-feature and transposes.
 load_otu_table <- function(filepath) {
   cat("  Loading OTU table:", filepath, "\n")
   first_line <- readLines(filepath, n = 1)
@@ -230,6 +333,15 @@ load_otu_table <- function(filepath) {
   as.data.frame(mat)
 }
 
+# load_taxonomy()
+# Purpose:    Read and parse a QIIME2-style taxonomy file, splitting the
+#             semicolon-delimited lineage string into Kingdom through Species.
+# Parameters: filepath -- path to taxonomy TSV
+# Returns:    data.frame with ASV IDs as rownames and columns for each
+#             taxonomic rank (Kingdom, Phylum, Class, Order, Family, Genus,
+#             Species), plus the original Taxon string and Confidence score.
+# Notes:      Strips QIIME2 prefix notation (e.g., "g__Vibrio" -> "Vibrio").
+#             Handles multiple input formats (ASV_ID/Taxon, ASV_ID/Meta_ID).
 load_taxonomy <- function(filepath) {
   cat("  Loading taxonomy:", filepath, "\n")
   tax <- read_tsv(filepath, show_col_types = FALSE)
@@ -262,6 +374,13 @@ load_taxonomy <- function(filepath) {
   tax_split
 }
 
+# load_metadata()
+# Purpose:    Read sample metadata, standardising the sample ID column name.
+# Parameters: filepath -- path to metadata TSV
+# Returns:    data.frame with sample IDs as rownames. The StudyID column
+#             (if present) is used throughout for study-level analyses.
+# Notes:      Recognises common QIIME2 sample ID synonyms (#SampleID,
+#             sample-id, sampleid, etc.) and renames to "SampleID".
 load_metadata <- function(filepath) {
   cat("  Loading metadata:", filepath, "\n")
   meta <- read_tsv(filepath, show_col_types = FALSE)
@@ -280,6 +399,16 @@ load_metadata <- function(filepath) {
 # Taxonomic aggregation
 # ------------------------------------------------------------------------------
 
+# aggregate_to_level()
+# Purpose:    Collapse ASV-level counts to a higher taxonomic rank (e.g., Genus
+#             or Family) by summing counts across all ASVs sharing the same
+#             classification at that rank.
+# Parameters: dataset_asv -- microeco microtable object at ASV resolution
+#             taxa_level  -- target rank ("ASV", "Genus", or "Family")
+# Returns:    New microtable object at the requested resolution. If taxa_level
+#             is "ASV", returns a deep clone of the input (no aggregation).
+# Notes:      Unclassified/unassigned ASVs are excluded from the aggregated
+#             table. Uses base R rowsum() for efficient grouped summation.
 aggregate_to_level <- function(dataset_asv, taxa_level) {
   if (taxa_level == "ASV") return(dataset_asv$clone(deep = TRUE))
   cat(sprintf("    Aggregating to %s level...\n", taxa_level))
@@ -308,6 +437,12 @@ aggregate_to_level <- function(dataset_asv, taxa_level) {
   ds
 }
 
+# make_taxa_unique()
+# Purpose:    Ensure no duplicate taxa names at the current resolution level.
+#             Duplicates can arise from ambiguous classifications.
+# Parameters: dataset    -- microtable object
+#             taxa_level -- column to check for duplicates
+# Returns:    Modified microtable (in-place update of tax_table)
 make_taxa_unique <- function(dataset, taxa_level) {
   tax <- dataset$tax_table
   if (taxa_level %in% colnames(tax)) {
@@ -321,9 +456,23 @@ make_taxa_unique <- function(dataset, taxa_level) {
 }
 
 # ------------------------------------------------------------------------------
-# Bland-Altman
+# Bland-Altman agreement plot
 # ------------------------------------------------------------------------------
 
+# bland_altman_plot()
+# Purpose:    Generate a Bland-Altman plot for assessing measurement agreement
+#             between pre- and post-trimming diversity metrics.
+# Parameters: x     -- numeric vector of "before" values
+#             y     -- numeric vector of "after" values
+#             title -- plot title
+#             xlab, ylab -- axis labels
+# Returns:    ggplot object showing difference vs mean, with bias line (blue)
+#             and 95% limits of agreement (red dashed, mean +/- 1.96*SD).
+# Context:    In clinical method comparison (Bland & Altman, 1986), the LoA
+#             define the range within which 95% of differences are expected.
+#             For ecological validation, points within the LoA indicate that
+#             trimming did not introduce systematic bias for that metric.
+#             Ideal result: bias near zero, narrow LoA.
 bland_altman_plot <- function(x, y, title = "Bland-Altman",
                               xlab = "Mean", ylab = "Difference (After - Before)") {
   means <- (x + y) / 2
@@ -348,9 +497,16 @@ bland_altman_plot <- function(x, y, title = "Bland-Altman",
 }
 
 # ------------------------------------------------------------------------------
-# Checkpoints
+# Checkpointing (resumable execution)
 # ------------------------------------------------------------------------------
 
+# save_checkpoint() / load_checkpoint()
+# Purpose:    Persist intermediate state to RDS files so the validation can
+#             resume from any tier without re-loading and re-processing data.
+#             Particularly useful when network analysis (Tier 3B) is slow.
+# Parameters: id        -- checkpoint identifier string (e.g., "data")
+#             data_list -- named list of objects to persist
+# Returns:    load_checkpoint returns the stored list, or NULL if not found
 save_checkpoint <- function(id, data_list) {
   saveRDS(data_list, file.path(CHECKPOINT_DIR, sprintf("ckpt_%s.rds", id)))
   cat(sprintf("  ✓ Checkpoint saved [%s]\n", id))
@@ -363,8 +519,12 @@ load_checkpoint <- function(id) {
 }
 
 # ------------------------------------------------------------------------------
-# Summary table helper
+# Summary results accumulator
 # ------------------------------------------------------------------------------
+# Global tibble that collects pass/fail results from every tier and level.
+# Each row records: taxonomic Level, Tier ID, Analysis name, Metric name,
+# numeric Value, pass Criteria description, and Status (PASS/MODERATE).
+# Written to validation_summary.csv at the end for thesis reporting.
 
 summary_results <- tibble(
   Level    = character(),
@@ -376,6 +536,16 @@ summary_results <- tibble(
   Status   = character()
 )
 
+# add_result()
+# Purpose:    Append a single validation result to the global summary_results.
+# Parameters: level     -- taxonomic level (e.g., "ASV", "Genus", "ALL")
+#             tier      -- tier identifier (e.g., "1A", "1B")
+#             analysis  -- analysis category name
+#             metric    -- specific metric name
+#             value     -- numeric result
+#             criteria  -- human-readable pass criterion description
+#             pass_flag -- logical, TRUE = PASS, FALSE = MODERATE
+# Side effect: Modifies summary_results in the global environment (<<-)
 add_result <- function(level, tier, analysis, metric, value, criteria, pass_flag) {
   status <- if (pass_flag) "PASS" else "MODERATE"
   summary_results <<- bind_rows(summary_results, tibble(
@@ -386,7 +556,26 @@ add_result <- function(level, tier, analysis, metric, value, criteria, pass_flag
 }
 
 # ==============================================================================
-# DATA LOADING (runs once, before the taxa loop)
+# TIER 0: SEQUENCE-LEVEL QC + DATA LOADING
+# ==============================================================================
+# This block runs once (not per taxonomic level). It performs three sequence-
+# level checks before loading the count data:
+#
+#   Tier 0A: Length distributions -- compares the coefficient of variation (CV)
+#            of sequence lengths before and after trimming. CV should decrease
+#            post-trim because SeCAT aligns sequences to a consensus region,
+#            producing more uniform lengths. An increase in CV would suggest
+#            the trimming introduced length artefacts.
+#
+#   Tier 0B: GC content preservation -- GC proportion should remain stable
+#            (< 2 percentage-point shift). A systematic GC shift would indicate
+#            that trimming preferentially removed AT-rich or GC-rich regions,
+#            potentially biasing downstream taxonomic classification.
+#
+#   Tier 0C: Consensus coordinate verification -- checks that the trim
+#            coordinates from the pipeline produced sequences within +/-10 bp
+#            of the expected consensus region length, and that >= 90% of
+#            studies were trimmed successfully.
 # ==============================================================================
 
 if (START_TIER == 0) {
@@ -398,6 +587,7 @@ if (START_TIER == 0) {
   seq_qc_results <- list()
 
   # --- 0A: Length distributions ---
+  # Requires Biostrings package and FASTA files in both pre/post directories
   if (HAS_BIOSTRINGS && file.exists(PRE_FA) && file.exists(POST_FA)) {
     cat("Tier 0A: Length distributions\n")
     seqs_before <- Biostrings::readDNAStringSet(PRE_FA)
@@ -411,7 +601,8 @@ if (START_TIER == 0) {
     cat(sprintf("  AFTER:  n=%d | median=%d bp | range=[%d, %d]\n",
                 length(len_after),  median(len_after),  min(len_after),  max(len_after)))
 
-    # Coefficient of variation should drop post-trim (more uniform lengths)
+    # Coefficient of variation (CV = SD/mean) should decrease post-trim.
+    # SeCAT trims to a consensus region, so length variance should shrink.
     cv_before <- sd(len_before) / mean(len_before)
     cv_after  <- sd(len_after)  / mean(len_after)
     cv_pass   <- cv_after <= cv_before
@@ -437,7 +628,10 @@ if (START_TIER == 0) {
            p_len, width = 10, height = 5)
     cat("  ✓ Length distribution plot saved\n")
 
-    # --- 0B: GC content ---
+    # --- 0B: GC content preservation ---
+    # GC content is a fundamental sequence property. Trimming should remove
+    # flanking regions symmetrically, preserving the overall GC distribution.
+    # A shift > 2 percentage points would suggest compositional bias.
     cat("\nTier 0B: GC content preservation\n")
     gc_before <- Biostrings::letterFrequency(seqs_before, letters = "GC",
                                              as.prob = TRUE)[, 1]
@@ -479,7 +673,10 @@ if (START_TIER == 0) {
     cat("    (Place sequences.fasta in unaligned_cleaned/ and aligned_trimmed/ to enable)\n\n")
   }
 
-  # --- 0C: Coordinate verification ---
+  # --- 0C: Consensus coordinate verification ---
+  # Cross-references the consensus region boundaries (from the alignment stage)
+  # against the actual trimmed sequence lengths reported in trim_summary.csv.
+  # Verifies that trimming hit the intended target region.
   cat("\nTier 0C: Consensus coordinate verification\n")
   if (file.exists(CONSENSUS_INFO) && file.exists(TRIM_SUMMARY)) {
     consensus_info <- read_csv(CONSENSUS_INFO, show_col_types = FALSE)
@@ -529,7 +726,10 @@ if (START_TIER == 0) {
 
   cat("\n✓ Tier 0 complete\n\n")
 
-  # --- Load OTU/tax/meta tables ---
+  # --- Load count data ---
+  # Load pre- and post-trimming OTU tables, taxonomy, and metadata. These are
+  # used for all subsequent tiers. Samples are aligned (intersected) to ensure
+  # paired comparison; features are intersected with their taxonomy tables.
   cat("================================================================================\n")
   cat("LOADING COUNT DATA\n")
   cat("================================================================================\n\n")
@@ -544,7 +744,8 @@ if (START_TIER == 0) {
   tax_after <- load_taxonomy(POST_TAX)
   meta_after <- load_metadata(POST_META)
 
-  # Align samples
+  # Align samples -- only samples present in BOTH datasets can be compared.
+  # This is essential for paired statistical tests (ICC, Bland-Altman, etc.).
   common_samples <- intersect(colnames(otu_before), colnames(otu_after))
   if (length(common_samples) == 0) stop("FATAL: No common samples between datasets.")
   cat(sprintf("\nCommon samples: %d\n", length(common_samples)))
@@ -564,7 +765,9 @@ if (START_TIER == 0) {
 
   cat(sprintf("Features BEFORE: %d | AFTER: %d\n\n", nrow(otu_before), nrow(otu_after)))
 
-  # Build ASV-level microtable objects
+  # Build ASV-level microtable objects (microeco package).
+  # These serve as the base for all taxonomic levels -- aggregate_to_level()
+  # collapses them to Genus or Family as needed in the validation loop.
   dataset_before_asv <- microtable$new(
     otu_table    = otu_before,
     tax_table    = tax_before,
@@ -610,6 +813,15 @@ if (START_TIER == 0) {
 # ==============================================================================
 # MULTI-LEVEL VALIDATION LOOP
 # ==============================================================================
+# Iterates over each requested taxonomic resolution (default: ASV, Genus,
+# Family). At each level, the full tier suite (1A through 4) is executed.
+# This multi-resolution approach is important because:
+#   - ASV level: tests whether individual sequence variants are preserved
+#   - Genus level: tests whether biologically meaningful groups are stable
+#   - Family level: tests robustness at coarser resolution (more conservative)
+# If trimming preserves ecological signal at all three levels, it provides
+# strong evidence that the harmonisation did not introduce systematic bias.
+# ==============================================================================
 
 for (taxa_level in TAXONOMIC_LEVELS) {
 
@@ -629,18 +841,41 @@ for (taxa_level in TAXONOMIC_LEVELS) {
   dataset_before <- make_taxa_unique(dataset_before, taxa_level)
   dataset_after  <- make_taxa_unique(dataset_after,  taxa_level)
 
-  # Alpha diversity (needed for Tier 1A, calculated once here)
+  # Compute alpha diversity indices (Observed, Chao1, ACE, Shannon, Simpson,
+  # Pielou) for both datasets. PD (phylogenetic diversity) is disabled as it
+  # requires a phylogenetic tree not available in the harmonised output.
   dataset_before$cal_alphadiv(PD = FALSE)
   dataset_after$cal_alphadiv(PD = FALSE)
   cat("  ✓ Alpha diversity calculated\n")
 
-  # Beta diversity (needed for Tier 1B, 1C)
+  # Compute beta diversity (Bray-Curtis dissimilarity). UniFrac is disabled
+  # because it requires a phylogenetic tree. Bray-Curtis is the standard
+  # distance metric for amplicon studies -- it is abundance-weighted and
+  # bounded [0,1], making it suitable for community composition comparison.
   dataset_before$cal_betadiv(unifrac = FALSE)
   dataset_after$cal_betadiv(unifrac = FALSE)
   cat("  ✓ Beta diversity calculated\n\n")
 
   # ============================================================================
   # TIER 1A: ALPHA DIVERSITY PRESERVATION
+  # ============================================================================
+  # Tests whether per-sample diversity metrics are preserved after trimming.
+  # Uses two complementary approaches:
+  #
+  #   ICC (Intraclass Correlation Coefficient, two-way agreement model):
+  #     Measures absolute agreement between before/after values. ICC > 0.90
+  #     indicates "excellent" agreement (Koo & Li, 2016). Unlike Pearson r,
+  #     ICC penalises systematic offsets, not just rank changes.
+  #
+  #   Spearman rho: Rank-based correlation as a complementary check. Less
+  #     sensitive to absolute scale shifts, but robust to outliers.
+  #
+  #   Bland-Altman plots: Visual assessment of agreement. Points should
+  #     scatter symmetrically around zero bias with narrow limits of agreement.
+  #
+  # Metrics tested: Observed richness, Chao1 (bias-corrected richness),
+  #   ACE (abundance-based coverage estimator), Shannon H' (entropy-based
+  #   diversity), Simpson 1-D (dominance-weighted), Pielou J' (evenness).
   # ============================================================================
 
   cat(sprintf("--- TIER 1A: Alpha Diversity (%s) ---\n\n", taxa_level))
@@ -665,6 +900,9 @@ for (taxa_level in TAXONOMIC_LEVELS) {
     bv  <- bv[idx]; av <- av[idx]
     if (length(bv) < 3) next
 
+    # Two-way random effects model with absolute agreement -- appropriate when
+    # both raters (before/after) are the only raters of interest and we care
+    # about agreement in actual values, not just consistency.
     icc_res <- irr::icc(data.frame(Before = bv, After = av),
                         model = "twoway", type = "agreement")
     icc_val <- icc_res$value
@@ -684,7 +922,9 @@ for (taxa_level in TAXONOMIC_LEVELS) {
                paste(m, "ICC"), icc_val, "> 0.90", pass)
   }
 
-  # Scatter plots
+  # Scatter plots: before vs after for each diversity metric. The red dashed
+  # 1:1 line shows perfect agreement; points above/below indicate systematic
+  # increase/decrease. The blue regression line reveals any proportional bias.
   scatter_list <- list()
   for (m in metrics) {
     bv <- alpha_b[[m]]; av <- alpha_a[[m]]
@@ -730,6 +970,25 @@ for (taxa_level in TAXONOMIC_LEVELS) {
   # ============================================================================
   # TIER 1B: BETA DIVERSITY PRESERVATION
   # ============================================================================
+  # Tests whether the overall community structure (inter-sample relationships)
+  # is preserved after trimming, using three complementary approaches:
+  #
+  #   Mantel test: Pearson correlation between the two Bray-Curtis distance
+  #     matrices (before vs after). Tests whether samples that were similar
+  #     before trimming remain similar after. r > 0.85 = strong preservation.
+  #     Uses 999 permutations for significance testing.
+  #
+  #   Procrustes analysis: Rotates, reflects, and scales the post-trimming
+  #     PCoA ordination to best fit the pre-trimming ordination. The residual
+  #     sum of squares (m2) quantifies misfit. m2 < 0.10 = excellent fit.
+  #     PROTEST adds a permutation test for the correlation between the two
+  #     configurations.
+  #
+  #   Delta-R2 PERMANOVA: Compares the proportion of variance explained by
+  #     StudyID before and after trimming. If trimming inflates the study
+  #     effect (delta-R2 > 0.05), it may be introducing batch artefacts.
+  #     Ideally delta-R2 <= 0 (study effect reduced or unchanged).
+  # ============================================================================
 
   cat(sprintf("\n--- TIER 1B: Beta Diversity (%s) ---\n\n", taxa_level))
 
@@ -740,7 +999,10 @@ for (taxa_level in TAXONOMIC_LEVELS) {
   db <- dist_b[common_dist, common_dist]
   da <- dist_a[common_dist, common_dist]
 
-  # Mantel test
+  # Mantel test: correlates the lower triangles of the two distance matrices.
+  # Pearson method chosen over Spearman because Bray-Curtis distances are
+  # bounded and approximately normally distributed for most community datasets.
+  # 999 permutations: standard for ecological studies (Anderson, 2001).
   set.seed(42)
   mantel_res <- vegan::mantel(as.dist(db), as.dist(da),
                               method = "pearson", permutations = 999)
@@ -751,7 +1013,12 @@ for (taxa_level in TAXONOMIC_LEVELS) {
   add_result(taxa_level, "1B", "Beta Diversity", "Mantel r",
              mantel_res$statistic, "> 0.85", mantel_pass)
 
-  # Procrustes / PROTEST
+  # Procrustes / PROTEST analysis
+  # PCoA (Principal Coordinates Analysis, aka classical MDS) embeds samples
+  # in Euclidean space preserving Bray-Curtis distances. k=3 axes capture
+  # the major variance dimensions. Procrustes then finds the optimal rotation
+  # to superimpose the "after" ordination onto the "before" ordination.
+  # symmetric=TRUE uses the symmetric Procrustes statistic (Peres-Neto & Jackson, 2001).
   pcoa_b <- cmdscale(as.dist(db), k = 3, eig = TRUE)
   pcoa_a <- cmdscale(as.dist(da), k = 3, eig = TRUE)
   proc   <- procrustes(pcoa_b$points, pcoa_a$points, symmetric = TRUE)
@@ -769,7 +1036,12 @@ for (taxa_level in TAXONOMIC_LEVELS) {
   add_result(taxa_level, "1B", "Beta Diversity", "PROTEST correlation",
              prot$t0, "> 0.95", prot_pass)
 
-  # PERMANOVA (delta-R² framing — change is the key metric)
+  # PERMANOVA (adonis2) -- delta-R2 framing
+  # PERMANOVA partitions variance in the distance matrix by a grouping factor
+  # (StudyID). The key metric is the CHANGE in R2, not the R2 itself.
+  # Assumptions: PERMANOVA is sensitive to differences in dispersion between
+  # groups (Anderson, 2001); betadisper in Tier 1C checks this assumption.
+  # A negative delta-R2 means trimming reduced the study batch effect (good).
   has_study_id <- "StudyID" %in% colnames(meta_before)
   if (has_study_id) {
     tryCatch({
@@ -797,7 +1069,10 @@ for (taxa_level in TAXONOMIC_LEVELS) {
     }, error = function(e) cat("  ⚠ PERMANOVA failed:", conditionMessage(e), "\n"))
   }
 
-  # PCoA plots
+  # PCoA ordination plots (before vs after)
+  # Uses microeco's trans_beta class for consistent plot styling. Ellipses
+  # (convex hulls) are drawn per StudyID when available, allowing visual
+  # assessment of whether study clusters maintain their separation pattern.
   tryCatch({
     beta_b <- trans_beta$new(
       dataset = dataset_before,
@@ -831,7 +1106,10 @@ for (taxa_level in TAXONOMIC_LEVELS) {
     cat("  ✓ PCoA plots saved\n")
   }, error = function(e) cat("  ⚠ PCoA plots failed:", conditionMessage(e), "\n"))
 
-  # Procrustes overlay plot
+  # Procrustes overlay plot -- shows each sample as a pair of points (before
+  # and after) connected by an arrow. Short arrows = good preservation.
+  # Colour-coded by StudyID to reveal whether any study is disproportionately
+  # affected by trimming.
   tryCatch({
     proc_df <- bind_rows(
       data.frame(PC1 = pcoa_b$points[, 1], PC2 = pcoa_b$points[, 2],
@@ -895,9 +1173,20 @@ for (taxa_level in TAXONOMIC_LEVELS) {
   # ============================================================================
   # TIER 1C: WITHIN-GROUP DISPERSION (betadisper / Levene analogue)
   # ============================================================================
-  # Tests whether trimming systematically alters within-group variance in
-  # community structure. A uniform shift in dispersion could confound
-  # downstream group comparisons.
+  # betadisper (Anderson, 2006) is the multivariate analogue of Levene's test.
+  # It computes each sample's distance to its group centroid in ordination
+  # space, then tests whether these distances differ between groups.
+  #
+  # Why this matters for validation:
+  #   - PERMANOVA is sensitive to heterogeneous dispersion (confounding).
+  #   - If trimming systematically shrinks or inflates within-study variance,
+  #     it would change the PERMANOVA interpretation.
+  #   - A relative change < 10% in mean distance-to-centroid is considered
+  #     negligible for this validation.
+  #
+  # The permutation test (permutest) assesses significance of dispersion
+  # differences among studies, in both the before and after datasets.
+  # ============================================================================
 
   if (has_study_id) {
     cat(sprintf("\n--- TIER 1C: Within-group Dispersion (%s) ---\n\n", taxa_level))
@@ -950,15 +1239,24 @@ for (taxa_level in TAXONOMIC_LEVELS) {
   # ============================================================================
   # TIER 1D: RANK ABUNDANCE CURVE PRESERVATION
   # ============================================================================
-  # For each sample, Spearman correlation between sorted relative abundances
-  # before and after trimming. High rho = the dominant→rare gradient preserved.
+  # Rank abundance (Whittaker) curves describe the dominance structure of a
+  # community: from the most abundant taxon to the rarest. This tier tests
+  # whether the shape of this curve is preserved after trimming.
+  #
+  # For each sample, relative abundances are sorted in decreasing order for
+  # both before and after datasets, then Spearman rho is computed between the
+  # two sorted vectors. High rho (> 0.90) = the dominant-to-rare gradient
+  # is preserved. This is important because ecological conclusions about
+  # community evenness and dominance depend on this structure.
+  # ============================================================================
 
   cat(sprintf("\n--- TIER 1D: Rank Abundance Preservation (%s) ---\n\n", taxa_level))
   tryCatch({
     otu_b_mat <- as.matrix(dataset_before$otu_table)
     otu_a_mat <- as.matrix(dataset_after$otu_table)
 
-    # Relative abundances per sample
+    # Relative abundances per sample (column-wise normalisation to proportions).
+    # This removes library size effects, focusing on compositional structure.
     rel_b <- sweep(otu_b_mat, 2, colSums(otu_b_mat), "/")
     rel_a <- sweep(otu_a_mat, 2, colSums(otu_a_mat), "/")
 
@@ -1009,8 +1307,20 @@ for (taxa_level in TAXONOMIC_LEVELS) {
   # ============================================================================
   # TIER 2A: CROSS-STUDY FEATURE SHARING
   # ============================================================================
-  # At Genus/Family: Jaccard index on named taxa across study pairs.
-  # At ASV level:    MetaASV cross-study sharing rate via asv_mapping_final.tsv.
+  # A core goal of SeCAT is to enable cross-study comparability. This tier
+  # tests whether trimming improves (or at least maintains) the degree of
+  # feature sharing between studies.
+  #
+  # At ASV level: Uses the MetaASV mapping to determine how many consensus
+  #   ASVs (MetaASVs) are detected in >= 2 studies. The rate should increase
+  #   or remain stable after trimming, because trimming to a common region
+  #   allows identical sequences from different studies to be recognised as
+  #   the same ASV.
+  #
+  # At Genus/Family level: Computes pairwise Jaccard similarity (intersection
+  #   over union) between the taxa detected in each study pair. A stable or
+  #   increasing mean Jaccard indicates that trimming did not cause
+  #   differential taxon dropout across studies.
 
   cat(sprintf("\n--- TIER 2A: Cross-study Sharing (%s) ---\n\n", taxa_level))
 
@@ -1022,7 +1332,10 @@ for (taxa_level in TAXONOMIC_LEVELS) {
 
     if (taxa_level == "ASV" && file.exists(ASV_MAPPING)) {
       # -----------------------------------------------------------------------
-      # ASV level: MetaASV sharing (how many MetaASVs appear in >= 2 studies)
+      # ASV level: MetaASV sharing rate
+      # Uses asv_mapping_final.tsv to bridge original ASV hashes to MetaASV
+      # IDs. For each MetaASV, counts how many distinct studies contribute
+      # detections. The sharing rate = proportion of MetaASVs in >= 2 studies.
       # -----------------------------------------------------------------------
       cat("  Using MetaASV mapping for ASV-level cross-study sharing\n")
       asv_map <- read_tsv(ASV_MAPPING, show_col_types = FALSE)
@@ -1077,8 +1390,13 @@ for (taxa_level in TAXONOMIC_LEVELS) {
 
     } else if (taxa_level %in% c("Genus", "Family")) {
       # -----------------------------------------------------------------------
-      # Genus/Family level: pairwise Jaccard on named taxa
+      # Genus/Family level: pairwise Jaccard similarity
+      # Jaccard index J(A,B) = |A intersect B| / |A union B|, where A and B
+      # are the sets of taxa detected in two studies. Ranges from 0 (no
+      # shared taxa) to 1 (identical taxa sets). Computed for all study pairs
+      # both before and after trimming.
       # -----------------------------------------------------------------------
+      # Jaccard index helper (set-based, presence/absence only)
       jaccard_idx <- function(a, b) {
         length(intersect(a, b)) / length(union(a, b))
       }

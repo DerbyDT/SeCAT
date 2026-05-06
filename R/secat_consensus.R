@@ -1,42 +1,40 @@
-##===============================================================================
-# FILENAME:   R/secat_consensus.R
-# PIPELINE:   SeCAT (Sequence Consensus Analysis Tool)
-# VERSION:    2.1.0 (Optimized Clique Detection)
-# AUTHOR:     [Author Name]
+# ==============================================================================
+# SCRIPT:   secat_consensus.R
+# PIPELINE: SeCAT v4.1 (Sequence Consensus Amplicon Trimming)
+# PURPOSE:  Compute the maximal overlapping 16S consensus region across studies
 #
-# PURPOSE:
-#   Identifies the "Consensus Region"—the shared genomic window that allows
-#   disparate studies to be compared. This script implements two distinct
-#   strategies depending on the analysis mode:
+# OVERVIEW:
+#   Identifies the "Consensus Region" -- the shared genomic window that allows
+#   disparate studies targeting different 16S variable regions to be compared.
+#   Two strategies are implemented: (1) Primer Mode aligns physical primer
+#   sequences to SILVA to determine canonical amplicon coordinates, then takes
+#   the intersection; (2) Study Mode builds a compatibility graph from empirical
+#   study coordinates and finds the largest clique of mutually overlapping
+#   studies, with greedy optimisation to remove outlier "constrictor" studies.
 #
-#   1. PRIMER MODE:
-#      Aligns physical primer sequences to a reference database to determine
-#      their canonical coordinates. The consensus is defined as the intersection
-#      of all primer amplicon regions.
+# SECTIONS:
+#   1. Primer Mode (Physical Alignment) -- vmatchPattern-based coordinate calling
+#   2. Study Mode (Graph-Theoretic Clique Detection) -- adjacency matrix + greedy
+#      constrictor removal via recursive optimisation
 #
-#   2. STUDY MODE:
-#      Identifies the "Largest Overlapping Clique" from a set of study coordinates.
-#      It builds a compatibility graph of studies and finds the largest subset
-#      that shares a sufficiently long window. It includes an optimization step
-#      to greedily remove "constrictor" studies (outliers that drastically
-#      shorten the consensus region) to maximize the available sequence length.
-#
-# INPUTS:
-#   - Primer Info (DataFrame) or Study Coordinates (Vectors).
-#   - Reference Database (FASTA/RNA) for Primer Mode.
-#
-# OUTPUTS:
-#   - Coordinates (Start/End) of the consensus region.
-#   - For Study Mode: Lists of included vs. excluded studies.
-#===============================================================================
+# SOURCED BY:
+#   - Nextflow processes that call consensus region calculation
+#   - 05_calculate_consensus.R (or equivalent orchestration script)
+# ==============================================================================
 
-#-------------------------------------------------------------------------------
-# Function:   calculate_mode
-#-------------------------------------------------------------------------------
-# Description:
-#   Calculates the statistical mode of a numeric vector.
-#   (Note: Duplicated from secat_utils.R; ensures this file is standalone).
-#-------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# Function: calculate_mode
+# Purpose:  Statistical mode (most frequent value) of a vector
+#
+# Parameters:
+#   @param x [vector] - Numeric or character vector
+#
+# Returns:
+#   @return [any] - Most frequent value; NA if empty. Ties broken by first max.
+#
+# Notes:
+#   Duplicated from secat_utils.R to keep this file self-contained.
+# ------------------------------------------------------------------------------
 calculate_mode <- function(x) {
   x <- x[!is.na(x)]
   if(length(x) == 0) return(NA_real_)
@@ -44,22 +42,24 @@ calculate_mode <- function(x) {
   ux[which.max(tabulate(match(x, ux)))]
 }
 
-#-------------------------------------------------------------------------------
-# Function:   relax_consensus_coords
-#-------------------------------------------------------------------------------
-# Description:
-#   Validates and relaxes invalid consensus coordinates (start >= end).
-#   Ensures ALL downstream consumers get valid start < end.
+# ------------------------------------------------------------------------------
+# Function: relax_consensus_coords
+# Purpose:  Validate and fix inverted consensus coordinates (start >= end)
 #
 # Parameters:
-#   @param clique_result - List from find_largest_overlapping_clique()
-#   @param all_starts, all_ends - Original study coordinate vectors
-#   @param study_names - All study names
-#   @param study_name - Label for logging
+#   @param clique_result [list] - Output from find_largest_overlapping_clique()
+#   @param all_starts    [numeric] - Start coordinates for all studies
+#   @param all_ends      [numeric] - End coordinates for all studies
+#   @param study_names   [character] - Study identifiers
+#   @param study_name    [character] - Label for log messages
 #
 # Returns:
-#   @return Fixed clique_result with guaranteed valid start/end
-#-------------------------------------------------------------------------------
+#   @return [list] - Corrected clique_result with guaranteed start < end
+#
+# Notes:
+#   Fallback uses the union of all study bounds with a minimum 50 bp window.
+#   This prevents downstream crashes from invalid coordinate ranges.
+# ------------------------------------------------------------------------------
 relax_consensus_coords <- function(clique_result, all_starts, all_ends, study_names, study_name = "consensus") {
   cons_start <- clique_result$start
   cons_end <- clique_result$end
@@ -68,11 +68,11 @@ relax_consensus_coords <- function(clique_result, all_starts, all_ends, study_na
     message(sprintf("[WARN] Invalid Consensus Detected (Start: %d >= End: %d) for %s. Applying smart relaxation...",
                     cons_start, cons_end, study_name))
 
-    # Use ALL study bounds as conservative fallback
+    # Fallback: use the full union of all study bounds
     study_min <- min(all_starts, na.rm = TRUE)
     study_max <- max(all_ends, na.rm = TRUE)
 
-    # Ensure minimum 50bp window matching min_overlap
+    # Guarantee at least 50 bp window (matches min_overlap default)
     relaxed_start <- min(study_min, study_max - 50)
     relaxed_end <- max(study_max, study_min + 50)
 
@@ -85,40 +85,30 @@ relax_consensus_coords <- function(clique_result, all_starts, all_ends, study_na
   return(clique_result)
 }
 
-#===============================================================================
-# SECTION 1: PRIMER MODE (Physical Alignment)
-#===============================================================================
+# ==== SECTION 1: PRIMER MODE (Physical Alignment) ====
+# Aligns physical primer sequences to SILVA reference to determine canonical
+# amplicon coordinates. The consensus is the intersection of all amplicons
+# (max start, min end).
 
-#-------------------------------------------------------------------------------
-# Function:   find_consensus_region
-#-------------------------------------------------------------------------------
-# Description:
-#   Determines the consensus region by aligning primer sequences to a full
-#   reference database.
-#
-# Scientific Context:
-#   In "Primer Mode", we assume the primers dictate the amplicon. To compare
-#   Dataset A (V4 region) and Dataset B (V3-V4 region), we must find the
-#   intersection of their physical coordinates on a canonical reference genome
-#   (e.g., E. coli 16S or SILVA).
-#
-# Algorithm:
-#   1. Load Reference: Reads RNA/DNA database (converting RNA to DNA if needed).
-#   2. Pre-processing: Removes gaps from the reference to allow precise matching.
-#   3. Alignment: Uses `vmatchPattern` (allowing mismatches) to find where each
-#      forward and reverse primer binds in the reference.
-#   4. Coordinate Calling: Takes the *modal* start/end position for each primer
-#      across all reference sequences (robust to paralogs/errors).
-#   5. Intersection: The global consensus is defined as the region covered by
-#      ALL mapped primers (Max(Start) to Min(End)).
+# ------------------------------------------------------------------------------
+# Function: find_consensus_region
+# Purpose:  Determine consensus region by aligning primer sequences to reference
 #
 # Parameters:
-#   @param primer_info_df [data.frame] - Columns: `primer_name`, `fwd_seq`, `rev_seq`.
-#   @param reference_db_path [character] - Path to reference FASTA.
+#   @param primer_info_df   [data.frame] - Columns: primer_name, fwd_seq, rev_seq
+#   @param reference_db_path [character] - Path to reference FASTA (SILVA RNA/DNA)
+#   @param config            [list]      - Optional config overrides
 #
 # Returns:
-#   @return [data.frame] - Table of primer coordinates + global consensus columns.
-#-------------------------------------------------------------------------------
+#   @return [data.frame] - Primer coordinates with global consensus_start/end columns
+#
+# Notes:
+#   Uses Biostrings::vmatchPattern with 4 mismatches to locate each primer in
+#   the ungapped reference. Modal hit positions are used (robust to paralogs).
+#   The global consensus = max(all starts) to min(all ends), i.e. the region
+#   covered by every primer pair simultaneously. A pre-ungapped reference can
+#   be passed via SECAT_UNGAPPED_DB env var to skip in-memory gap removal.
+# ------------------------------------------------------------------------------
 find_consensus_region <- function(primer_info_df, reference_db_path, config = list()) {
 
   # --- 1. Input Validation ---

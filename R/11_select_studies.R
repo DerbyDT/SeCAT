@@ -1,11 +1,39 @@
 #!/usr/bin/env Rscript
-# scripts/11_select_studies.R (V3 - Integrated Verdict Logic)
+# ==============================================================================
+# SCRIPT:   11_select_studies.R
+# PIPELINE: SeCAT v4.1 (Sequence Consensus Amplicon Trimming)
+# STAGE:    11 - Study Selection
+# PURPOSE:  Interactive two-stage CLI for selecting taxonomic level and studies
 #
-# PURPOSE: Two-stage interactive CLI:
-#          1. User selects taxonomic level
-#          2. Verdicts are calculated for that level
-#          3. User reviews and selects studies
+# OVERVIEW:
+#   This script provides an interactive wizard that guides the user through
+#   study selection for the SeCAT trimming pipeline. First, the user selects
+#   a taxonomic level at which to evaluate trim verdicts. Then, verdicts are
+#   computed for each study (KEEP, CAUTION_IMPACT, DROP_OUTLIER) based on
+#   geometric outlier detection and biological impact thresholds. The user
+#   can accept the default (KEEP-only) selection or manually override it.
+#   Upon confirmation, the script auto-launches 12_trim_sequences.R.
+#
+# INPUTS:
+#   - output/aggregated_data/verdict_data_all_levels.csv
+#       Pre-computed verdict data across all taxonomic levels (from Stage 10)
+#
+# OUTPUTS:
+#   - output/aggregated_data/selected_studies_for_trim.txt
+#       Newline-delimited list of study names selected for trimming
+#   - output/aggregated_data/selected_analysis_level.txt
+#       Single-line file recording the chosen taxonomic level
+#   - output/aggregated_data/final_trim_verdicts.csv
+#       CSV of study verdicts (Study, Final_Verdict, Reason)
+#
+# DEPENDENCIES:
+#   - dplyr, tidyr, ggplot2, readr, stringr, purrr, tibble, here
+#
+# CALLED BY:
+#   - Manual execution or Nextflow select_studies module
+# ==============================================================================
 
+# --- Load Required Packages ---
 suppressPackageStartupMessages({
   suppressPackageStartupMessages(library(dplyr))
 suppressPackageStartupMessages(library(tidyr))
@@ -22,6 +50,8 @@ cat("                    MESAP FINAL TRIM SELECTION WIZARD                      
 cat("================================================================================\n")
 
 # --- 1. Load Raw Verdict Data (All Levels) ---
+# The verdict file contains pre-computed trimming assessments for every study
+# at every taxonomic level. It is produced by the earlier verdict generation step.
 verdict_file <- here("output/aggregated_data/verdict_data_all_levels.csv")
 
 if (!file.exists(verdict_file)) {
@@ -31,6 +61,9 @@ if (!file.exists(verdict_file)) {
 master_verdicts <- read_csv(verdict_file, show_col_types = FALSE)
 
 # --- 2. Stage 1: Select Taxonomic Level ---
+# The user chooses which taxonomic rank (e.g., Family, Genus) to use for
+# evaluating whether trimming will degrade biological signal. Different ranks
+# may yield different verdict outcomes because diversity sensitivity varies.
 cat("\n--- STAGE 1: SELECT TAXONOMIC LEVEL ---\n\n")
 
 available_levels <- unique(master_verdicts$Level)
@@ -43,9 +76,9 @@ level_summary <- tibble()
 for (i in seq_along(available_levels)) {
   level <- available_levels[i]
   level_data <- master_verdicts %>% filter(Level == !!level)
-  
+
   unique_studies <- length(unique(level_data$Study))
-  
+
   level_summary <- bind_rows(level_summary, tibble(
     ID = i,
     Level = level,
@@ -66,6 +99,7 @@ cat("\nEnter the Level ID to analyze (e.g., '5' for Family level):\n")
 cat("> ")
 
 # Read Level Selection
+# Supports both interactive (readline) and non-interactive (stdin) modes
 if (interactive()) {
   level_input <- readline()
 } else {
@@ -83,6 +117,12 @@ selected_level <- available_levels[selected_level_id]
 cat(sprintf("\nSelected Level: %s\n", selected_level))
 
 # --- 3. Calculate Verdicts for Selected Level ---
+# Verdicts are determined by two independent checks per study:
+#   (a) Geometric check: Is the study's amplicon region an outlier relative
+#       to the consensus? (based on Is_Outlier flag from earlier analysis)
+#   (b) Biological impact check: Does the required trimming exceed the
+#       changepoint threshold at which diversity loss becomes significant?
+# The combined verdict is: DROP_OUTLIER > CAUTION_IMPACT > KEEP.
 cat("\nCalculating verdicts for ", selected_level, " level...\n")
 
 level_verdicts <- master_verdicts %>%
@@ -93,23 +133,23 @@ level_verdicts <- master_verdicts %>%
   mutate(
     # 1. Geometric Check
     Status_Geo = if_else(Is_Outlier, "FAIL_OUTLIER", "PASS"),
-    
+
     # 2. Biological Impact Check
     Safe_Limit = replace_na(Threshold_Observed_Changepoint, Inf),
     Status_Bio = if_else(Threshold_Required >= Safe_Limit, "FAIL_IMPACT", "PASS"),
-    
+
     # 3. Combined Verdict
     Final_Verdict = case_when(
       Status_Geo == "FAIL_OUTLIER" ~ "DROP_OUTLIER",
       Status_Bio == "FAIL_IMPACT"  ~ "CAUTION_IMPACT",
       TRUE                         ~ "KEEP"
     ),
-    
+
     # Reason
     Reason = case_when(
       Final_Verdict == "DROP_OUTLIER" ~ "Does not overlap consensus region",
-      Final_Verdict == "CAUTION_IMPACT" ~ 
-        paste0("Req. trim (", Threshold_Required, "bp) exceeds safe limit (", 
+      Final_Verdict == "CAUTION_IMPACT" ~
+        paste0("Req. trim (", Threshold_Required, "bp) exceeds safe limit (",
                pmin(Safe_Limit, Threshold_Observed_Changepoint, na.rm=TRUE), "bp)"),
       TRUE ~ "Safe to trim"
     )
@@ -118,6 +158,8 @@ level_verdicts <- master_verdicts %>%
   arrange(Final_Verdict, Study)
 
 # --- 4. Stage 2: Select Studies (Based on Chosen Level) ---
+# Present the user with an ANSI-coloured table of verdicts and allow them
+# to confirm the default KEEP-only set or manually specify study IDs.
 cat("\n--- STAGE 2: SELECT STUDIES FOR ANALYSIS ---\n\n")
 
 verdicts <- level_verdicts
@@ -129,19 +171,19 @@ cat("---------------------------------------------------------------------------
 
 for(i in 1:nrow(verdicts)) {
   row <- verdicts[i,]
-  
+
   # ANSI Color Codes
-  color_start <- switch(row$Final_Verdict, 
+  color_start <- switch(row$Final_Verdict,
                        "KEEP" = "\033[32m",           # Green
                        "CAUTION_IMPACT" = "\033[33m", # Yellow
                        "DROP_OUTLIER" = "\033[31m",   # Red
                        "\033[0m")
   color_end <- "\033[0m"
-  
-  cat(sprintf("%-4d %-28s %s%-18s%s %-45s\n", 
-              i, 
+
+  cat(sprintf("%-4d %-28s %s%-18s%s %-45s\n",
+              i,
               substr(row$Study, 1, 28),
-              color_start, row$Final_Verdict, color_end, 
+              color_start, row$Final_Verdict, color_end,
               substr(row$Reason, 1, 45)))
 }
 cat("--------------------------------------------------------------------------------\n")
@@ -174,7 +216,8 @@ if (interactive()) {
   user_input <- readLines("stdin", n=1, warn=FALSE)
 }
 
-# Parse Input
+# --- Parse User Input ---
+# Empty input accepts the default KEEP-only set; otherwise parse comma-separated IDs
 selected_indices <- integer(0)
 
 if (length(user_input) == 0 || trimws(user_input) == "") {
@@ -185,11 +228,11 @@ if (length(user_input) == 0 || trimws(user_input) == "") {
   # Parse comma-separated string
   clean_input <- gsub(" ", "", user_input)
   parts <- unlist(strsplit(clean_input, ","))
-  
+
   # Convert to integer
   selected_indices <- as.integer(parts)
   selected_indices <- selected_indices[!is.na(selected_indices)]
-  
+
   # Validate range
   valid_mask <- selected_indices >= 1 & selected_indices <= nrow(verdicts)
   if (any(!valid_mask)) {
@@ -199,6 +242,8 @@ if (length(user_input) == 0 || trimws(user_input) == "") {
 }
 
 # --- 5. Save Selections ---
+# Write three output files: the study roster, the taxonomic level choice,
+# and the full verdict table for downstream audit/provenance.
 
 if (length(selected_indices) == 0) {
   stop("No valid studies selected. Exiting without saving.")
@@ -226,6 +271,8 @@ cat(sprintf("✓ Level saved to:   %s\n", level_file))
 cat(sprintf("✓ Verdicts saved to: %s\n", verdicts_file))
 
 # --- 6. Auto-Launch Trimmer ---
+# Chain directly into the trimming step (12_trim_sequences.R) so that the
+# user experiences a single continuous workflow from selection through trimming.
 cat("\n================================================================================\n")
 cat("                          LAUNCHING STANDARDIZATION                             \n")
 cat("================================================================================\n\n")

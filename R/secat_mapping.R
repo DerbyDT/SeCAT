@@ -1,46 +1,49 @@
-#===============================================================================
-# FILENAME:   R/secat_mapping.R
-# PIPELINE:   SeCAT (Sequence Consensus Analysis Tool)
-# VERSION:    1.0.0
-# AUTHOR:     [Author Name]
+# ==============================================================================
+# SCRIPT:   secat_mapping.R
+# PIPELINE: SeCAT v4.1 (Sequence Consensus Amplicon Trimming)
+# PURPOSE:  Reference mapping engine — aligns study ASV sequences to the SILVA
+#           reference to determine each study's amplicon coordinates.
 #
-# PURPOSE:
-#   Determines the genomic coordinates (start/end) for a given study relative
-#   to a reference database.
+# OVERVIEW:
+#   This library provides the core function map_study_to_reference(), which:
+#   1. Optionally subsamples ASVs for speed (configurable via USE_ALL_ASVS)
+#   2. Builds or loads a SILVA reference subset for DECIPHER alignment
+#   3. Aligns study ASVs to the SILVA profile using DECIPHER::AlignSeqs()
+#   4. Determines the modal start/end positions across all aligned ASVs
+#   5. Returns the study-level coordinates, per-ASV coordinates, and alignment
 #
-# STRATEGIES:
-#   1. STUDY MODE (Recommended):
-#      Uses Profile Alignment (via the DECIPHER package) to map a subset of
-#      actual ASV sequences to a reference alignment (e.g., SILVA). This
-#      empirically determines the region covered by the study.
+#   The modal coordinate approach is robust to outlier ASVs that align poorly
+#   (e.g., chimeric sequences or non-16S contaminants). The alignment is also
+#   saved for use in the trimming analysis (06_analyse_real.R), where sequences
+#   are trimmed in alignment space rather than raw sequence space.
 #
-#   2. PRIMER MODE (Legacy/Fallback):
-#      Parses theoretical coordinates directly from primer names (e.g.,
-#      extracting "515" and "806" from "515F_806R"). This relies on standardized
-#      naming conventions and does not validate the actual sequences.
-#
-# INPUTS:
-#   - Study Info (List): Contains file paths and metadata.
-#   - Reference DB (FASTA): A pre-aligned reference database.
-#   - Config (List): Parameters for alignment and subsampling.
-#
-# OUTPUTS:
-#   - Summary List containing:
-#     * summary: Data frame with study-level consensus coordinates.
-#     * coords: Data frame with per-ASV coordinates.
-#     * alignment: The DNAStringSet of aligned ASVs.
-#===============================================================================
+# SOURCED BY:
+#   - 02_study_mapping.R (via map_study_to_reference())
+# ==============================================================================
 
 suppressPackageStartupMessages(library(Biostrings))
 suppressPackageStartupMessages(library(DECIPHER))
 suppressPackageStartupMessages(library(tibble))
 
-#-------------------------------------------------------------------------------
-# Function:   calculate_mode
-#-------------------------------------------------------------------------------
-# Description:
-#   Calculates the statistical mode. (Duplicate utility).
-#-------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# Function: calculate_mode
+# ------------------------------------------------------------------------------
+# Purpose:
+#   Returns the statistical mode (most frequent value) of a numeric vector.
+#   Used to find the dominant start/end alignment column across all ASVs in a
+#   study, which defines the consensus amplicon window.
+#
+# Parameters:
+#   @param x  [numeric] Vector of values (typically alignment column indices).
+#
+# Returns:
+#   @return [numeric(1)] The most frequent value, or NA_real_ if input is empty.
+#
+# Notes:
+#   Ties are broken by first occurrence (which.max returns the first maximum).
+#   This is acceptable because tied modes in amplicon data are rare — the vast
+#   majority of ASVs from a single primer pair share identical start/end columns.
+# ------------------------------------------------------------------------------
 calculate_mode <- function(x) {
   x <- x[!is.na(x)]
   if(length(x) == 0) return(NA_real_)
@@ -48,12 +51,25 @@ calculate_mode <- function(x) {
   ux[which.max(tabulate(match(x, ux)))]
 }
 
-#-------------------------------------------------------------------------------
-# Function:   parse_primer_positions (Legacy Helper)
-#-------------------------------------------------------------------------------
-# Description:
-#   Extracts numeric coordinates from standard primer names (e.g., "515F_806R").
-#-------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# Function: parse_primer_positions (Legacy Helper)
+# ------------------------------------------------------------------------------
+# Purpose:
+#   Extracts numeric start/end coordinates from standardised primer name strings
+#   (e.g., "515F_806R" -> start=515, end=806). This is the legacy/fallback
+#   approach that trusts primer naming conventions rather than empirical alignment.
+#
+# Parameters:
+#   @param primer_name [character(1)] Primer pair string with forward (F) and
+#     reverse (R) tokens separated by "_", "-", or ".".
+#
+# Returns:
+#   @return [list] With elements $start and $end (integer or NA_integer_).
+#
+# Notes:
+#   Only used in "primer" analysis mode. The "study" mode (DECIPHER alignment)
+#   is preferred because primer names can be non-standard or misleading.
+# ------------------------------------------------------------------------------
 parse_primer_positions <- function(primer_name) {
     # Allow separators like "_", "-", or "." and extra prefixes
     parts <- strsplit(primer_name, "[-_.]")[[1]]
@@ -75,20 +91,35 @@ parse_primer_positions <- function(primer_name) {
     list(start = fwd_pos, end = rev_pos)
 }
 
-#-------------------------------------------------------------------------------
-# Function:   calculate_consensus_coordinates
-#-------------------------------------------------------------------------------
-# Description:
-#   Aggregates individual ASV coordinates into a single consensus window for
-#   the study.
+# ------------------------------------------------------------------------------
+# Function: calculate_consensus_coordinates
+# ------------------------------------------------------------------------------
+# Purpose:
+#   Aggregates per-ASV alignment coordinates into a single consensus amplicon
+#   window for the study. This is the critical step that converts hundreds or
+#   thousands of individual ASV mappings into a single (start, end) pair.
 #
-# Methods:
-#   - "modal" (Default): The most common start/end positions. Best for
-#     amplicon data where most reads should start at the exact primer site.
-#   - "percentile": Uses 10th/90th percentiles. Robust to outliers/artifacts.
-#   - "minimum": Extends from min start to max end. Maximizes coverage but
-#     riskier with noisy data.
-#-------------------------------------------------------------------------------
+# Parameters:
+#   @param all_ref_starts [integer] Vector of alignment-column start positions
+#     for each successfully mapped ASV.
+#   @param all_ref_ends   [integer] Vector of alignment-column end positions.
+#   @param method         [character(1)] Consensus strategy; one of:
+#     - "modal"      (Default, recommended): Most frequent start/end values.
+#                    Best for amplicon data where most ASVs share exact primer
+#                    binding sites. Robust to chimeric or off-target outlier ASVs.
+#     - "percentile": Uses 10th percentile for start, 90th for end. More
+#                    conservative; captures slight primer-landing variation.
+#     - "minimum":   min(start) to max(end). Maximises coverage but vulnerable
+#                    to a single misaligned ASV widening the window.
+#
+# Returns:
+#   @return [list] With elements $start and $end (integer).
+#
+# Notes:
+#   The method is set via config$STUDY_ALIGNMENT_METHOD (default "modal").
+#   For well-behaved amplicon datasets, all three methods yield identical results
+#   because ASVs from a single primer pair align to the same reference columns.
+# ------------------------------------------------------------------------------
 calculate_consensus_coordinates <- function(all_ref_starts, all_ref_ends, method = "modal") {
   if (method == "modal") {
     start <- calculate_mode(all_ref_starts)
@@ -107,39 +138,58 @@ calculate_consensus_coordinates <- function(all_ref_starts, all_ref_ends, method
   return(list(start = start, end = end))
 }
 
-#-------------------------------------------------------------------------------
-# Function:   map_study_to_reference
-#-------------------------------------------------------------------------------
-# Description:
-#   The core mapping function. Coordinates the entire workflow of loading data,
-#   aligning (or parsing), and returning coordinates.
+# ------------------------------------------------------------------------------
+# Function: map_study_to_reference
+# ------------------------------------------------------------------------------
+# Purpose:
+#   Core mapping function for the SeCAT pipeline. Determines the amplicon
+#   coordinates of a study by aligning its ASV sequences to a SILVA reference
+#   profile. This is the empirical alternative to trusting primer-name metadata.
 #
 # Scientific Context:
-#   Accurate coordinate mapping is essential for meta-analysis. If Study A
-#   claims to be "V4" but actually covers V3-V4 due to a protocol modification,
+#   Accurate coordinate mapping is essential for cross-study meta-analysis. A
+#   study labelled "V4" may actually cover V3-V4 due to a protocol modification;
 #   relying on metadata alone would lead to invalid biological comparisons.
-#   This function allows us to verify the *actual* coverage empirically.
+#   This function verifies the *actual* amplicon coverage empirically by aligning
+#   real ASV sequences against a common reference coordinate system (SILVA).
 #
-# Algorithm (Study Mode):
-#   1. Subsampling: Randomly selects N ASVs (default 1000) to represent the study.
-#      This is computationally efficient and statistically sufficient to find the
-#      consensus window.
-#   2. Reference Prep: Loads a pre-aligned reference (e.g., SILVA), optionally
-#      subsetting it to speed up profile alignment.
-#   3. Alignment: Uses `DECIPHER::AlignProfiles`. This treats the reference as
-#      a fixed profile and aligns the ASVs to it, preserving the reference's
-#      coordinate system.
-#   4. Coordinate Extraction: Converts the alignment gaps (`-`) into numerical
-#      start/end indices relative to the reference columns.
+# Algorithm (Study Mode — the recommended path):
+#   1. Subsampling: Randomly selects N ASVs (default controlled by ASV_SAMPLE_SIZE
+#      or USE_ALL_ASVS) to represent the study. A subset is statistically
+#      sufficient to find the consensus window and dramatically reduces runtime.
+#   2. Reference Prep: Loads the pre-aligned SILVA reference, optionally
+#      subsetting it (REFERENCE_ALIGNMENT_MODE / REFERENCE_SUBSET_SIZE) to
+#      accelerate profile construction.
+#   3. Alignment: First aligns ASVs to each other via DECIPHER::AlignSeqs(),
+#      then merges the ASV profile into the SILVA profile via
+#      DECIPHER::AlignProfiles(). This preserves the reference coordinate system.
+#   4. Coordinate Extraction: Finds the first and last non-gap character for
+#      each aligned ASV, yielding per-ASV start/end column indices.
+#   5. Consensus: Applies calculate_consensus_coordinates() (modal by default)
+#      to collapse per-ASV coordinates into a single study-level window.
 #
 # Parameters:
-#   @param study_info [list] - Metadata including `asv_fasta_path`.
-#   @param reference_db_path [character] - Path to reference alignment.
-#   @param config [list] - Configuration options (e.g., `ASV_SAMPLE_SIZE`).
+#   @param study_info        [list] Study metadata; must contain $study_name,
+#     $asv_fasta_path, $primer_name, $initial_fwd_trim, $initial_rev_trim.
+#   @param reference_db_path [character(1)] Path to the SILVA aligned FASTA file.
+#   @param config            [list] Pipeline configuration; key fields used:
+#     $ANALYSIS_MODE             — "study" (DECIPHER) or "primer" (legacy).
+#     $USE_ALL_ASVS              — logical; if TRUE, skip subsampling.
+#     $ASV_SAMPLE_SIZE           — integer; max ASVs to subsample.
+#     $REFERENCE_ALIGNMENT_MODE  — "full" or "subset".
+#     $REFERENCE_SUBSET_SIZE     — integer; how many SILVA sequences to use.
+#     $STUDY_ALIGNMENT_METHOD    — "modal", "percentile", or "minimum".
 #
 # Returns:
-#   @return [list] - Detailed results object with summary stats and the raw alignment.
-#-------------------------------------------------------------------------------
+#   @return [list] with three elements:
+#     $summary   — tibble: one row with study-level consensus coordinates,
+#                  amplicon length, method used, and number of ASVs mapped.
+#     $coords    — tibble: per-ASV start/end coordinates for diagnostics.
+#     $alignment — DNAStringSet: the aligned ASV sequences in SILVA coordinate
+#                  space. Used downstream in 06_analyse_real.R for trimming
+#                  in alignment space.
+#   Returns NULL if the FASTA is missing/empty or alignment fails.
+# ------------------------------------------------------------------------------
 map_study_to_reference <- function(study_info, reference_db_path, config) {
 
   message(paste("Processing study:", study_info$study_name))
@@ -323,19 +373,34 @@ map_study_to_reference <- function(study_info, reference_db_path, config) {
   ))
 }
 
-#-------------------------------------------------------------------------------
-# Function:  relax_consensus_coords
-#-------------------------------------------------------------------------------
-# Description:
-#  Relax invalid consensus coordinates with deterministic fallback
-#' Ensures Start < End for ALL downstream consumers (viz, aggregation, verdicts)
-#' @param clique_result List from find_largest_overlapping_clique()
-#' @param all_starts,all_ends Original study coordinate vectors  
-#' @param study_names All study names
-#' @return Fixed clique_result with valid start/end
-#' @export
-#   Calculates the statistical mode. (Duplicate utility).
-#-------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# Function: relax_consensus_coords
+# ------------------------------------------------------------------------------
+# Purpose:
+#   Safety net that detects and repairs degenerate consensus coordinates where
+#   start >= end. This can occur when studies in the overlapping clique have
+#   very narrow or contradictory amplicon windows. Without this fix, downstream
+#   consumers (visualisation, aggregation, verdict generation) would fail or
+#   produce nonsensical results.
+#
+# Parameters:
+#   @param clique_result [list] Output from find_largest_overlapping_clique();
+#     must contain $start, $end, and $n_studies.
+#   @param all_starts    [integer] Start coordinates for all studies (not just
+#     the clique), used as a fallback to define a valid window.
+#   @param all_ends      [integer] End coordinates for all studies.
+#   @param study_names   [character] Names of all studies (used to update
+#     n_studies if relaxation is applied).
+#   @param study_name    [character(1)] Label for log messages (default "consensus").
+#
+# Returns:
+#   @return [list] The input clique_result, potentially with $start, $end, and
+#     $n_studies corrected. Guarantees start < end with a minimum 50 bp window.
+#
+# Notes:
+#   The 50 bp minimum window matches the min_overlap parameter used elsewhere
+#   in the clique-finding algorithm, ensuring consistency.
+# ------------------------------------------------------------------------------
 relax_consensus_coords <- function(clique_result, all_starts, all_ends, study_names, study_name = "consensus") {
   cons_start <- clique_result$start
   cons_end <- clique_result$end

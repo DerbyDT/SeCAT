@@ -1,92 +1,435 @@
-# SeCAT v4.1 — Run Parameters
-# ============================================================================
-# Edit the two required fields below, then run:
+# ==============================================================================
+# FILE:     params.yaml
+# PIPELINE: SeCAT v4.1 (Sequence Consensus Amplicon Trimming)
+# PURPOSE:  User-facing parameter file — the primary interface for configuring
+#           a SeCAT run without editing pipeline code.
 #
-#   nextflow run DerbyDT/SeCAT \
-#       -profile slurm,singularity \
-#       -params-file params.yaml
+# OVERVIEW:
+#   This YAML file defines every tuneable parameter for the SeCAT pipeline.
+#   Values here override the defaults in nextflow.config and are injected into
+#   R scripts via environment variables. Edit the two required paths below,
+#   review simulation and statistical parameters, then launch with:
+#     nextflow run -profile slurm,singularity -params-file params.yaml
 #
-# For site-specific HPC settings (partition names, account flags) also pass:
-#       -c conf/custom.config        (your institution)
-#       -c conf/jasmin.config        (JASMIN LOTUS2)
-# ============================================================================
+# USAGE:
+#   Passed to Nextflow via the -params-file flag. For site-specific HPC
+#   settings (partition names, account flags), also pass:
+#     -c conf/custom.config        (your institution)
+#     -c conf/jasmin.config        (JASMIN LOTUS2)
+# ==============================================================================
 
-# ── Required ─────────────────────────────────────────────────────────────────
+# ==============================================================================
+# REQUIRED INPUTS
+# These two paths must be set before running the pipeline.
+# ==============================================================================
+
+# Path to the SeCAT manifest TSV. This tab-delimited file lists every study
+# to be harmonised, with columns for study ID, primer pair, ASV table path,
+# taxonomy path, and metadata path.
+# Valid values: absolute path to a correctly formatted SeCAT manifest.
+# Data impact: defines the entire study set entering the pipeline.
 manifest:     "/home/users/dterrey/secat_data/secat_manifest_jasmin.tsv"
+
+# Path to the SILVA reference alignment (full-length, aligned, truncated FASTA).
+# Must be the NR99 (non-redundant 99%) version for consistent coordinate mapping.
+# Valid values: absolute path to SILVA_138.x_SSURef_NR99 aligned FASTA.
+# Data impact: all trimming positions are defined in SILVA alignment coordinates.
+#   Changing the reference version invalidates previously computed consensus regions.
 reference_db: "/home/users/dterrey/secat_data/references/SILVA_138.2_SSURef_NR99_tax_silva_full_align_trunc.fasta"
 
-# ── Output ────────────────────────────────────────────────────────────────────
+# ==============================================================================
+# OUTPUT DIRECTORY
+# ==============================================================================
+
+# Root output directory. All results, intermediate files, and reports are
+# written to subdirectories beneath this path.
 outdir: "output"
 
-# ── Analysis mode ─────────────────────────────────────────────────────────────
-analysis_mode: "study"   # "study" or "primer"
+# ==============================================================================
+# ANALYSIS MODE
+# ==============================================================================
 
-# ── Simulations ───────────────────────────────────────────────────────────────
+# Granularity of trimming analysis.
+# Valid values: "study" (full study sequences used for alignement) or "primer"
+#   (primer sequences used for alignment).
+# Data impact: "study" mode captures study-specific biases (extraction protocol,
+#   sequencing platform); "primer" mode not currently functional
+analysis_mode: "study"  
+
+# ==============================================================================
+# SIMULATION ENGINE
+# Generates synthetic communities with Grinder-inspired PCR bias, sequencing
+# errors, and chimeras to build null distributions for each primer pair.
+# These null distributions underpin the statistical test for whether observed
+# trimming degradation is biologically meaningful or stochastic noise.
+# All defaults below are calibrated via testing for optimal Type I error control.
+# ==============================================================================
+
+# Number of independent synthetic communities generated per primer pair.
+# Valid values: positive integer (50-1000; 100 recommended for publication).
+# Data impact: more simulations tighten null distributions and stabilise
+#   p-values. Fewer than 50 risk unreliable Type I error control. Runtime
+#   scales linearly with this value.
 num_simulations:         100
+
+# Maximum SILVA sequences retained in the simulation reference subset.
+# Valid values: positive integer (5000-50000).
+# Data impact: larger subsets capture more taxonomic diversity in null
+#   communities but increase memory and runtime. Diminishing returns above ~15000.
 sim_max_silva_subset:    10000
+
+# Reuse a previously built SILVA subset rather than re-sampling.
+# Valid values: true / false.
+# Data impact: true speeds up reruns; false forces fresh random sampling,
+#   giving slightly different null distributions each time.
 sim_use_prebuilt_subset: true
+
+# Species abundance distribution model for synthetic communities.
+# Valid values: "lognormal" (ecologically realistic SAD with dominance
+#   hierarchy) or "uniform" (equal abundances — useful for diagnostics).
+# Data impact: "lognormal" mimics real community structure where a few taxa
+#   dominate; "uniform" may underestimate trimming impacts driven by rare taxa.
 sim_abundance_model:     "lognormal"
+
+# Mean of the log-normal SAD (log scale).
+# Valid values: positive numeric (typically 3-8).
+# Data impact: higher values shift the distribution toward higher mean
+#   abundances, producing more even communities. Default (5) mimics typical
+#   marine/soil 16S profiles.
 sim_lognormal_mu:        5
+
+# Standard deviation of the log-normal SAD (log scale).
+# Valid values: positive numeric (typically 1-4).
+# Data impact: higher values widen the abundance range, creating more
+#   extreme dominance patterns (very abundant + very rare taxa).
 sim_lognormal_sigma:     2
+
+# Enable GC-content-dependent PCR amplification bias.
+# Valid values: true / false.
+# Data impact: true introduces realistic differential amplification —
+#   essential for calibrating null distributions against real PCR artefacts.
+#   false assumes perfect PCR (unrealistic but isolates other effects).
 sim_add_pcr_bias:        true
+
+# Number of PCR cycles to simulate.
+# Valid values: positive integer (15-35; 25 = standard for most 16S protocols).
+# Data impact: more cycles amplify GC bias exponentially. Values above 30
+#   produce extreme compositional distortion in the null model.
 sim_pcr_cycles:          25
+
+# Strength of GC-content bias during simulated PCR (0 = none, 1 = extreme).
+# Valid values: 0-1 (0.65 = moderate, empirically calibrated).
+# Data impact: higher values increase differential amplification of sequences
+#   near the optimal GC content, widening null distributions.
 sim_pcr_gc_bias:         0.65
+
+# Optimal GC fraction for maximum simulated PCR efficiency.
+# Valid values: 0-1 (0.50 = balanced; typical for most polymerases).
+# Data impact: sequences near this GC content are preferentially amplified.
+#   Shifting from 0.50 biases the null model toward AT-rich or GC-rich taxa.
 sim_pcr_optimal_gc:      0.50
+
+# Enable simulated sequencing errors (substitutions + indels).
+# Valid values: true / false.
+# Data impact: true produces noisy reads that may inflate ASV counts in the
+#   null model; false gives error-free sequences (unrealistic but diagnostic).
 sim_add_errors:          true
+
+# Per-base substitution error rate for simulated sequencing.
+# Valid values: 0-1 (0.003 = 0.3%, typical Illumina MiSeq).
+# Data impact: higher rates widen null distributions, making it harder to
+#   detect real degradation signals. Match to your platform's empirical rate.
 sim_error_rate:          0.003
+
+# Per-base insertion/deletion error rate.
+# Valid values: 0-1 (0.00003 = 0.003%, typical Illumina).
+# Data impact: indels cause alignment artefacts and spurious ASVs. Higher
+#   rates inflate null-model diversity.
 sim_indel_rate:          0.00003
+
+# Whether error rate increases toward 3' end of reads (Illumina quality decay).
+# Valid values: true / false.
+# Data impact: true concentrates errors at read ends — the positions most
+#   affected by trimming — producing more realistic null distributions.
 sim_error_position_bias: true
+
+# Enable simulated chimeric sequences (inter-template PCR recombinants).
+# Valid values: true / false.
+# Data impact: true inflates diversity in null communities. Disabled by
+#   default because most modern pipelines (DADA2, Deblur) remove chimeras
+#   before SeCAT receives data.
 sim_add_chimeras:        false
+
+# Fraction of reads that are chimeric (only active when sim_add_chimeras: true).
+# Valid values: 0-1 (0.02 = 2%, conservative estimate).
+# Data impact: higher rates increase spurious diversity in null communities.
 sim_chimera_rate:        0.02
 
-# ── Trimming ──────────────────────────────────────────────────────────────────
+# ==============================================================================
+# TRIMMING CONFIGURATION
+# Controls how progressively more aggressive trimming is applied to aligned
+# ASVs to build degradation curves.
+# ==============================================================================
+
+# How trim positions are spaced across the amplicon.
+# Valid values: "absolute" (fixed base-pair increments) or "scaled"
+#   (increments proportional to amplicon length).
+# Data impact: "absolute" gives uniform bp resolution across all primers;
+#   "scaled" normalises trimming effort so short and long amplicons are
+#   sampled comparably.
 trim_step_mode:          "absolute"
+
+# Base-pair increment per trim step.
+# Valid values: positive numeric (5-100 bp).
+# Data impact: smaller increments give finer resolution for detecting the
+#   degradation threshold but increase compute time proportionally.
+#   100 bp works well with "absolute" mode; 5 bp suits "scaled" mode.
 trim_increment:          100
+
+# Maximum number of trim steps to evaluate per primer/study.
+# Valid values: positive integer (10-200).
+# Data impact: caps the search space. Too few may miss the degradation point;
+#   too many wastes compute on biologically irrelevant extreme trims.
 default_max_trim_steps:  50
+
+# Extra trim steps beyond the consensus region boundary (safety buffer).
+# Valid values: positive integer (5-50).
+# Data impact: ensures degradation curves extend past the candidate trim
+#   point, giving changepoint detection sufficient post-change data points.
 consensus_buffer_steps:  20
+
+# Hard ceiling on total trim steps (safety guard for edge cases).
+# Valid values: positive integer.
+# Data impact: prevents runaway computation; should never be reached in
+#   normal operation.
 max_absolute_trim_steps: 2000
 
-# ── Quality filters ───────────────────────────────────────────────────────────
+# ==============================================================================
+# QUALITY FILTERS
+# Pre-trim filters that remove low-quality or uninformative samples/taxa
+# before degradation analysis.
+# ==============================================================================
+
+# Minimum relative abundance for a taxon to be retained.
+# Valid values: 0-1 (0 = no filtering; 0.001 = drop taxa below 0.1%).
+# Data impact: higher values remove rare taxa, reducing noise but potentially
+#   masking impacts on low-abundance community members.
 min_relative_abundance:  0
+
+# Minimum number of taxa required to compute Bray-Curtis distance.
+# Valid values: positive integer (>= 2; 3 recommended).
+# Data impact: samples with fewer taxa are excluded from degradation curves,
+#   preventing degenerate distance calculations from near-empty communities.
 min_taxa_for_bray:       3
+
+# Minimum median read depth across samples for a study to be included.
+# Valid values: positive numeric (100-1000).
+# Data impact: filters out severely undersequenced studies that would produce
+#   unreliable compositional profiles.
 min_median_read_depth:   100
 
-# ── Changepoint detection ─────────────────────────────────────────────────────
+# ==============================================================================
+# CHANGEPOINT DETECTION (PELT ALGORITHM)
+# Identifies the trim step where Bray-Curtis distance shows a statistically
+# significant shift — the point beyond which trimming causes unacceptable
+# community distortion.
+# Defaults calibrated via testing for optimal Type I error control.
+# ==============================================================================
+
+# Penalty method for the PELT (Pruned Exact Linear Time) changepoint algorithm.
+# Valid values: "MANUAL" (user-scaled penalty via multiplier below), "BIC",
+#   "AIC", "MBIC", "SIC" (information-criterion auto-penalties).
+# Data impact: "MANUAL" gives direct control over sensitivity.
+#   Information-criterion methods auto-calibrate but may be too liberal (AIC)
+#   or conservative (BIC) depending on the noise structure of the data.
 changepoint_penalty_method:     "MANUAL"
+
+# Multiplier for MANUAL penalty (penalty = multiplier * variance of data).
+# Valid values: positive numeric (0.1-100; higher = less sensitive).
+# Data impact: increasing this value makes PELT detect fewer changepoints,
+#   tolerating more degradation before flagging a study. Decreasing it
+#   flags smaller shifts but increases false positive rate. Note: this
+#   params.yaml sets 50; nextflow.config defaults to 1. The params.yaml
+#   value takes precedence when using -params-file.
 changepoint_penalty_multiplier: 50
 
-# ── Null model ────────────────────────────────────────────────────────────────
+# ==============================================================================
+# NULL MODEL COMPARISON
+# Tests whether observed trimming degradation exceeds what synthetic (null)
+# communities produce — i.e., whether the real signal is biologically
+# meaningful or just stochastic noise from the simulation engine.
+# Defaults calibrated via testing for optimal Type I error control.
+# ==============================================================================
+
+# P-value threshold for rejecting the null (observed degradation = simulated).
+# Valid values: 0-1 (0.05 = standard alpha level).
+# Data impact: lower values are more conservative — fewer studies flagged as
+#   significantly degraded, reducing false positives but potentially missing
+#   real trimming artefacts.
 null_model_p_threshold:     0.05
+
+# Number of consecutive trim steps that must exceed the null threshold to
+# trigger a "significant degradation" verdict.
+# Valid values: positive integer (1-10).
+# Data impact: higher values require sustained degradation rather than a
+#   single noisy spike, reducing false positives at the cost of delayed
+#   detection. Note: this params.yaml sets 2; nextflow.config defaults to 3.
 null_model_min_consecutive:  2
+
+# Minimum base pairs of trimming before null model testing begins.
+# Valid values: positive numeric (5-20 bp).
+# Data impact: creates a "dead zone" at the start of the trimming curve
+#   where trivially small trims are not tested (distance changes unreliable
+#   at very small trims).
 null_model_min_trim_bp:      5
+
+# Absolute Bray-Curtis distance threshold (secondary method, complementing
+# the null model). A study is flagged if median Bray-Curtis exceeds this.
+# Valid values: 0-1 (0.20 = 20% compositional dissimilarity).
+# Data impact: lower values are stricter (flag more studies); higher values
+#   tolerate more change. 0.20 is a moderate ecological threshold.
+#   Note: this params.yaml sets 0.20; nextflow.config defaults to 0.15.
 distance_cutoff_threshold:   0.20
+
+# Minimum base pairs before distance cutoff is evaluated (same dead-zone
+# logic as null_model_min_trim_bp).
+# Valid values: positive numeric.
 distance_cutoff_min_trim_bp: 5
 
-# ── Consensus ─────────────────────────────────────────────────────────────────
+# ==============================================================================
+# CONSENSUS REGION OPTIMISATION
+# Finds the maximal overlapping 16S region across all primer pairs, subject
+# to a maximum tolerable degradation threshold per study.
+# ==============================================================================
+
+# Maximum Sequence length increase to exclude a study in the
+# consensus trim region.
+# Valid values: 0-1 (0.20 = a 20% increase in sequence length drops study restricting the consensus window).
+# Data impact: lower values include more studies (wider participation) but
+#   contain fewer sequences. Lower values produce a more
+#   wider consensus but may exclude studies.
 consensus_optimization_threshold: 0.20
+
+# Minimum number of studies that must contribute to the consensus region.
+# Valid values: positive integer (>= 2).
+# Data impact: higher values ensure the consensus is broadly supported.
+#   May cause failure if too few studies share overlapping regions.
 min_consensus_studies:            3
+
+# Minimum fraction of input studies representable in the consensus.
+# Valid values: 0-1 (0.50 = at least half of input studies).
+# Data impact: proportional guard ensuring the consensus is not driven by
+#   a small subset of studies.
 min_consensus_coverage:           0.50
 
-# ── Reference alignment ───────────────────────────────────────────────────────
+# ==============================================================================
+# REFERENCE ALIGNMENT SETTINGS
+# Controls how ASVs are aligned to SILVA for coordinate mapping.
+# ==============================================================================
+
+# Alignment mode: how much of the SILVA reference is used for DECIPHER alignment.
+# Valid values: "subset" (random SILVA subset for speed) or "full" (entire DB).
+# Data impact: "subset" is dramatically faster and usually sufficient for
+#   well-characterised environments. "full" may improve accuracy for highly
+#   divergent sequences but requires 64+ GB RAM and much longer runtime.
 reference_alignment_mode: "subset"
+
+# Number of SILVA sequences in the alignment reference subset.
+# Valid values: positive integer (1000-50000; 5000 recommended).
+# Data impact: larger subsets improve alignment accuracy with diminishing
+#   returns above ~10000 for typical datasets.
 reference_subset_size:    5000
 
-# ── Merge ─────────────────────────────────────────────────────────────────────
-merge_method:       "advanced"
-harmonize_metadata: true
-selection_mode: "roster"   # "auto", "file", or "roster"
-selection_file: "/home/users/dterrey/SeCAT/selection_roster.txt"       # path to roster file (only used when selection_mode = "roster")
+# ==============================================================================
+# MERGE AND METADATA HARMONISATION
+# Controls how trimmed study-level ASV tables are combined into the final
+# unified cross-study dataset.
+# ==============================================================================
 
-# ── Reports ───────────────────────────────────────────────────────────────────
+# Merge method for combining trimmed ASV tables.
+# Valid values: "advanced" (taxonomy-aware merging with conflict resolution)
+#   or "simple" (direct concatenation without reconciliation).
+# Data impact: "advanced" handles ASV identity conflicts and inconsistent
+#   taxonomic assignments across studies; "simple" is faster but may produce
+#   duplicated taxa with conflicting annotations.
+merge_method:       "advanced"
+
+# Whether to standardise metadata column names using synonym mapping.
+# Valid values: true / false.
+# Data impact: true unifies heterogeneous column names (e.g., "lat" ->
+#   "Latitude") enabling cross-study metadata joins. false preserves
+#   original column names, requiring manual harmonisation.
+harmonize_metadata: true
+
+# Study selection mode for the merge step.
+# Valid values: "auto" (include all studies with KEEP verdict), "roster" (curated list file).
+# Data impact: controls which studies enter the merged dataset. "auto"
+#   includes everything the pipeline approves; "roster"/"file" allow
+#   manual curation after reviewing per-study verdicts.
+# note: due to the conservative nature of the package, auto mode is not
+# recommended on new datasets not already vetted via a previous run. 
+# Manual review of the datasets and trim results is preferable to allow
+# for appropriate verdict selection. 
+selection_mode: "roster"  
+
+# Path to the roster/selection file (only used when selection_mode = "roster"
+# ). One study ID per line.
+selection_file: "/home/users/dterrey/SeCAT/selection_roster.txt"       
+
+# ==============================================================================
+# REPORTS AND OUTPUT CONTROL
+# ==============================================================================
+
+# Plot resolution in dots per inch. Affects file size and print quality.
+# Valid values: positive integer (150-600; 300 = publication standard).
 plot_dpi:         300
+
+# Force regeneration of all outputs, ignoring cached intermediate results.
+# Valid values: true / false.
+# Data impact: true ensures a fully clean run (essential after parameter
+#   changes); false reuses cached outputs where possible (faster for
+#   iterative development).
 force_regenerate: false
 
-# ── Alignment ────────────────────────────────────────────────────────────────
-use_all_asvs: true   # use all ASVs for DECIPHER alignment (false = subsample)
-asv_sample_size:        5000    # subsample size when use_all_asvs is false
+# ==============================================================================
+# ASV ALIGNMENT OPTIONS
+# ==============================================================================
 
-# ── Pipeline stages ───────────────────────────────────────────────────────────
-run_validation: true    # run multi-tier ecological validation after merge
-auto_trim:      false   # set to true to automatically run trim/merge after verdict (skips manual review)
-                        # when true, selection_mode defaults to "auto" (all KEEP studies included)
-validation_levels: "ASV,Genus,Family"   # comma-separated taxonomic levels for validation
+# Whether to use all ASVs for alignment or subsample for speed.
+# Valid values: true / false.
+# Data impact: true uses every ASV (most accurate alignment, higher memory);
+#   false subsamples to asv_sample_size (faster but may miss rare sequence
+#   variants in the alignment).
+use_all_asvs: true   
+
+# Number of ASVs to subsample when use_all_asvs is false.
+# Valid values: positive integer (>100-10000).
+# Data impact: more ASVs improve alignment coverage; fewer are faster.
+#   Only relevant when use_all_asvs: false.
+asv_sample_size:        5000    
+
+# ==============================================================================
+# PIPELINE STAGE CONTROL
+# Toggle major pipeline stages on/off and control automation level.
+# ==============================================================================
+
+# Whether to run multi-tier ecological validation after the merge step.
+# Valid values: true / false.
+# Data impact: true runs alpha-diversity, beta-diversity, and taxonomic
+#   composition checks on the merged dataset. false skips validation
+run_validation: true   
+
+# Whether to automatically execute trim/merge after the verdict step.
+# Valid values: true / false.
+# Data impact: true skips the manual review pause, proceeding directly from
+#   per-study verdicts to trimming and merging. When true, selection_mode
+#   defaults to "auto" (all KEEP studies included). false pauses after
+#   verdicts for user review — recommended for first runs or when exploring
+#   parameter sensitivity.
+auto_trim:      false   
+
+# Taxonomic levels at which to run ecological validation.
+# Valid values: comma-separated string of ranks (e.g., "ASV,Genus,Family").
+# Data impact: more levels give a multi-resolution view of harmonisation
+#   quality but increase validation runtime.
+validation_levels: "ASV,Genus,Family"   
