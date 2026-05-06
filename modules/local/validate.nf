@@ -40,6 +40,7 @@ input:
 
     export SECAT_OUTDIR="."
     export SECAT_PROJECTDIR="${projectDir}"
+    export SECAT_VALIDATION_LEVELS="${params.validation_levels ?: "ASV,Genus,Family"}"
 
     Rscript ${projectDir}/R/validation_taxon_v2.R \
         0 \

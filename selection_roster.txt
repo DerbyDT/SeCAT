@@ -41,7 +41,6 @@
 # Add your study names below this line, one per line:
 Brauer_2022
 Crump_2018_301bp
-Cucio_2016
 Fahimipour_2017
 Iqbal_2021
 Iqbal_2023

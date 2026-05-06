@@ -3,8 +3,8 @@ process MERGE_DATASETS {
     label 'mem_30g'
     publishDir "${params.outdir}/meta_analysis",              mode: 'copy', pattern: "combined_*"
     publishDir "${params.outdir}/meta_analysis",              mode: 'copy', pattern: "asv_mapping_final.tsv"
-    publishDir "${params.outdir}/comparison/pre_consensus",   mode: 'copy', pattern: "pre_consensus/*"
-    publishDir "${params.outdir}/comparison/post_consensus",  mode: 'copy', pattern: "post_consensus/*"
+    publishDir "${params.outdir}/comparison/pre_consensus",  mode: 'copy', pattern: "pre_consensus/*.tsv"
+    publishDir "${params.outdir}/comparison/post_consensus", mode: 'copy', pattern: "post_consensus/*.tsv"
 
     input:
     path standardized_fastas

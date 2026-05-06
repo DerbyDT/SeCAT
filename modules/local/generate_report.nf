@@ -8,6 +8,8 @@ process GENERATE_REPORT {
     path aggregated_dir
     path verdict_data
     path rds_files
+    path study_coords
+    path consensus_info
 
     output:
     path "*.pdf",          emit: pdf_reports, optional: true
@@ -21,16 +23,12 @@ process GENERATE_REPORT {
     cp -r ${aggregated_dir}/* output/aggregated_data/ 2>/dev/null || true
     cp ${verdict_data} output/aggregated_data/verdict_data_all_levels.csv
 
-    # Stage all per-study RDS files into real_data_results
     for f in ${rds_files}; do
         cp \$f output/real_data_results/
     done
 
-    # Copy intermediate files needed for alignment plot
-    cp ${params.outdir}/intermediate/study_alignment_coords.csv \
-       output/intermediate/study_alignment_coords.csv 2>/dev/null || true
-    cp ${params.outdir}/intermediate/consensusregioninfo.csv \
-       output/intermediate/consensusregioninfo.csv 2>/dev/null || true
+    cp ${study_coords} output/intermediate/study_alignment_coords.csv
+    cp ${consensus_info} output/intermediate/consensusregioninfo.csv
 
     export SECAT_MANIFEST="${params.manifest}"
     export SECAT_ANALYSIS_MODE="${params.analysis_mode}"

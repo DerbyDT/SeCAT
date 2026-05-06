@@ -160,14 +160,7 @@ CONSENSUS_INFO <- file.path(BASE_DIR, "output/intermediate/consensusregioninfo.c
 TRIM_SUMMARY   <- file.path(BASE_DIR, "output/standardized_datasets/trim_summary.csv")
 ASV_MAPPING    <- file.path(BASE_DIR, "asv_mapping_final.tsv")
 
-TAXONOMIC_LEVELS <- {
-  env_levels <- Sys.getenv("SECAT_VALIDATION_LEVELS", "")
-  if (nchar(env_levels) > 0) {
-    strsplit(env_levels, ",")[[1]]
-  } else {
-    c("ASV", "Genus", "Family")
-  }
-}
+TAXONOMIC_LEVELS <- c("ASV", "Genus", "Family")
 
 OUTPUT_DIR     <- file.path(BASE_DIR, "outputs")
 PLOTS_DIR      <- file.path(OUTPUT_DIR, "figures")
@@ -1018,7 +1011,7 @@ for (taxa_level in TAXONOMIC_LEVELS) {
     studies <- unique(meta_before$StudyID)
     studies <- studies[!is.na(studies)]          # drop NA study IDs before matrix build
     n_studies <- length(studies)
-    cat(sprintf("  Studies: %d (%s)\n", n_studies, paste(studies, collapse=", ")))
+    cat(sprintf("  Studies: %d (%s)\n", nstudies, paste(studies, collapse=", ")))
 
     if (taxa_level == "ASV" && file.exists(ASV_MAPPING)) {
       # -----------------------------------------------------------------------
@@ -1126,11 +1119,11 @@ for (taxa_level in TAXONOMIC_LEVELS) {
     write_csv(as.data.frame(ji_mat_b) %>% 
                 `rownames<-`(make.names(rownames(ji_mat_b), unique=TRUE)) %>%
                 rownames_to_column("Study"),
-               file.path(level_out, "jaccard_before.csv"))
+               file.path(levelout, "jaccard_before.csv"))
     write_csv(as.data.frame(ji_mat_a) %>% 
                 `rownames<-`(make.names(rownames(ji_mat_a), unique=TRUE)) %>%
                 rownames_to_column("Study"),
-              file.path(level_out, "jaccard_after.csv"))
+              file.path(levelout, "jaccard_after.csv"))
       cat("  ✓ Jaccard matrices saved\n")
 
     } else {
@@ -1144,6 +1137,7 @@ for (taxa_level in TAXONOMIC_LEVELS) {
   # ============================================================================
   # TIER 3A: TAXONOMIC COMPOSITION BAR PLOTS
   # ============================================================================
+
 cat(sprintf("--- TIER 3A: Taxonomic Composition (%s) ---\n\n", taxa_level))
 display_rank <- if (taxa_level == "ASV") "Phylum" else taxa_level
 tryCatch({
@@ -1152,21 +1146,16 @@ tryCatch({
   tab_a <- trans_abund$new(dataset = dataset_after,  taxrank = display_rank, ntaxa = 10,
                            groupmean = if (has_study_id) "StudyID" else NULL)
 
-  # Extract taxa names from the transformed data (data_abund, not abund_list)
-  taxa_col <- colnames(tab_b$data_abund)[1]
-  all_taxa <- union(unique(tab_b$data_abund[[taxa_col]]),
-                    unique(tab_a$data_abund[[taxa_col]]))
-  n_taxa   <- length(all_taxa)
-  pal_cols <- if (n_taxa <= 12) {
+  # Build a shared colour palette across both datasets
+  all_taxa  <- union(tab_b$abund_list[[1]] %>% pull(1) %>% unique(),
+                     tab_a$abund_list[[1]] %>% pull(1) %>% unique())
+  n_taxa    <- length(all_taxa)
+  pal_cols  <- if (n_taxa <= 12) {
     RColorBrewer::brewer.pal(max(3, n_taxa), "Paired")[seq_len(n_taxa)]
   } else {
     colorRampPalette(RColorBrewer::brewer.pal(12, "Paired"))(n_taxa)
   }
   shared_pal <- setNames(pal_cols, all_taxa)
-
-  # Force consistent factor levels so stacking order matches between plots
-  tab_b$data_abund[[taxa_col]] <- factor(tab_b$data_abund[[taxa_col]], levels = names(shared_pal))
-  tab_a$data_abund[[taxa_col]] <- factor(tab_a$data_abund[[taxa_col]], levels = names(shared_pal))
 
   p_bar_b <- tab_b$plot_bar(legend_text_italic = FALSE) +
     scale_fill_manual(values = shared_pal, drop = FALSE) +
@@ -1318,20 +1307,22 @@ tryCatch({
       })
     }
 
-# Export networks for Gephi
-tryCatch({
-  igraph::write_graph(g_b,
-    file.path(level_out, sprintf("12_%s_network_before.graphml", tolower(taxa_level))),
-    format = "graphml")
-  igraph::write_graph(g_a,
-    file.path(level_out, sprintf("13_%s_network_after.graphml", tolower(taxa_level))),
-    format = "graphml")
-  cat("  ✓ Network graphs exported for Gephi (GraphML format)\n")
-}, error = function(e) cat("  ⚠ Network export failed:", conditionMessage(e), "\n"))
+    # Network plots
+    tryCatch({
+      p_nb <- net_b$plot_network(label = FALSE, node_size = 2) +
+        labs(title = sprintf("Network — Before (%s)", taxa_level))
+      p_na <- net_a$plot_network(label = FALSE, node_size = 2) +
+        labs(title = sprintf("Network — After (%s)", taxa_level))
+      ggsave(file.path(level_plot, sprintf("12_%s_network_before.pdf", tolower(taxa_level))),
+             p_nb, width = 12, height = 10)
+      ggsave(file.path(level_plot, sprintf("13_%s_network_after.pdf", tolower(taxa_level))),
+             p_na, width = 12, height = 10)
+      cat("  ✓ Network plots saved\n")
+    }, error = function(e) cat("  ⚠ Network plots failed:", conditionMessage(e), "\n"))
 
-}, error = function(e) {
-  cat(sprintf("  ⚠ Network analysis failed: %s\n", conditionMessage(e)))
-})
+  }, error = function(e) {
+    cat(sprintf("  ⚠ Network analysis failed: %s\n", conditionMessage(e)))
+  })
 
   # ============================================================================
   # TIER 4: ABUNDANCE CONCORDANCE

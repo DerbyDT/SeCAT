@@ -180,12 +180,13 @@ workflow {
 
     GENERATE_VERDICTS(AGGREGATE.out.master_verdict_table)
 
-GENERATE_REPORT(
-    AGGREGATE.out.aggregated_dir,
-    GENERATE_VERDICTS.out.verdict_data,
-    ANALYSE_REAL.out.results_rds.collect()   // stages all 11 RDS files flat into work dir
+    GENERATE_REPORT(
+        AGGREGATE.out.aggregated_dir,
+        GENERATE_VERDICTS.out.verdict_data,
+        ANALYSE_REAL.out.results_rds.collect(),
+        collected_coords,
+        PREPARE_SIMS.out.consensus_info.first()
     )
-
     if (params.auto_trim) {
         log.warn "auto_trim=true: Trimming with KEEP-only verdicts."
         TRIM_SEQUENCES(

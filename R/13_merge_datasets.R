@@ -73,16 +73,24 @@ manifest <- read_tsv(SECAT_MANIFEST_PATH, show_col_types = FALSE)
 
 trim_summary_file <- file.path(STD_DIR, "trim_summary.csv")
 trim_summary <- read_csv(trim_summary_file, show_col_types = FALSE)
-successful_studies <- trim_summary %>%
-  filter(status == "SUCCESS") %>%
-  pull(study_name)
 
-failed_studies <- trim_summary %>%
-  filter(status != "SUCCESS") %>%
-  pull(study_name)
+if (SELECTION_MODE == "roster") {
+  # Roster mode: trust the roster entirely, don't filter by trim_summary status
+  successful_studies <- selected_studies
+  failed_studies     <- character(0)
+  cat(sprintf("Roster mode: trusting roster directly (%d studies).\n",
+              length(successful_studies)))
+} else {
+  successful_studies <- trim_summary %>%
+    filter(status == "SUCCESS") %>%
+    pull(study_name)
+  failed_studies <- trim_summary %>%
+    filter(status != "SUCCESS") %>%
+    pull(study_name)
+}
 
-cat(sprintf("Selected: %d | Passed: %d | Failed: %d\n", 
-            length(selected_studies), 
+cat(sprintf("Selected: %d | Passed: %d | Failed: %d\n",
+            length(selected_studies),
             length(successful_studies),
             length(failed_studies)))
 
@@ -94,6 +102,47 @@ cat("\n")
 if (length(successful_studies) == 0) {
   stop("FATAL: No studies passed trimming!")
 }
+
+# ==============================================================================
+# UTILITY FUNCTION: BioSample Run Fetching
+# ==============================================================================
+fetch_run_to_biosample <- function(run_ids, cache_path) {
+  if (file.exists(cache_path)) {
+    cat("  ✓ Using cached run→biosample map:", cache_path, "\n")
+    return(read_tsv(cache_path, show_col_types = FALSE))
+  }
+
+  cat("  Fetching run→biosample mapping from NCBI for", length(run_ids), "run IDs...\n")
+
+  chunk_size <- 200
+  chunks     <- split(run_ids, ceiling(seq_along(run_ids) / chunk_size))
+  results    <- list()
+
+  for (i in seq_along(chunks)) {
+    ids_str <- paste(chunks[[i]], collapse = ",")
+    url     <- paste0(
+      "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi",
+      "?db=sra&id=", ids_str, "&rettype=runinfo&retmode=text"
+    )
+    tryCatch({
+      raw        <- read_csv(url, show_col_types = FALSE)
+      results[[i]] <- raw %>%
+        select(run_accession = Run, SampleID = BioSample) %>%
+        filter(!is.na(run_accession), run_accession != "")
+      Sys.sleep(0.4)  # respect NCBI rate limits
+    }, error = function(e) {
+      cat("  ✗ efetch failed for chunk", i, ":", conditionMessage(e), "\n")
+    })
+  }
+
+  mapping <- bind_rows(results)
+  if (nrow(mapping) > 0) {
+    write_tsv(mapping, cache_path)
+    cat(sprintf("  ✓ Cached %d mappings to %s\n", nrow(mapping), cache_path))
+  }
+  return(mapping)
+}
+
 
 # ==============================================================================
 # UTILITY FUNCTION: ROBUST TABLE LOADING
@@ -246,14 +295,48 @@ for (study in successful_studies) {
     n_match <- sum(ft_samples %in% meta_samples)
     match_pct <- 100 * n_match / length(ft_samples)
     
-    cat(sprintf("  → Metadata↔Feature table: %d/%d matched (%.1f%%)\n", 
+    cat(sprintf("  → Metadata↔Feature table: %d/%d matched (%.1f%%)\n",
                 n_match, length(ft_samples), match_pct))
-    
+
     if (match_pct < 50) {
-      cat("  ⚠️ WARNING: Less than 50% match! Metadata may be for wrong study/subset\n")
-      cat(sprintf("     Example FT samples: %s\n", paste(head(ft_samples, 3), collapse = ", ")))
-      cat(sprintf("     Example meta samples: %s\n", paste(head(meta_samples, 3), collapse = ", ")))
+      cat("  ⚠️  Low match (", round(match_pct), "%). Checking if FT IDs are run accessions...\n")
+
+      is_run_acc <- grepl("^[DES]RR[0-9]+$", ft_samples)
+
+      if (mean(is_run_acc) >= 0.8) {
+        # Derive study directory from the manifest asv_counts_path
+        study_path <- dirname(study_row$asv_counts_path[1])
+        cache_path <- file.path(study_path, "run_to_sample.tsv")
+
+        run_map <- fetch_run_to_biosample(ft_samples[is_run_acc], cache_path)
+
+        if (nrow(run_map) > 0) {
+          run_to_id <- setNames(run_map$SampleID, run_map$run_accession)
+
+          # Rename columns in orig_counts (the actual FT object in scope)
+          old_names <- colnames(orig_counts)
+          colnames(orig_counts)[old_names %in% names(run_to_id)] <-
+            run_to_id[old_names[old_names %in% names(run_to_id)]]
+
+          # Update ft_samples to reflect renamed columns
+          ft_samples <- colnames(orig_counts)[-1]
+
+          # Re-store the renamed FT so downstream processing uses it
+          untrimmed_features[[study]] <- orig_counts
+
+          match_pct <- 100 * sum(ft_samples %in% meta_samples) / length(ft_samples)
+          cat(sprintf("  ✓ After remap: %.1f%% match (%d/%d samples)\n",
+                      match_pct, sum(ft_samples %in% meta_samples), length(ft_samples)))
+        } else {
+          cat("  ✗ efetch returned no mappings. Metadata will be absent for this study.\n")
+        }
+      } else {
+        cat("  ✗ FT IDs don't look like run accessions — manual investigation needed.\n")
+      }
     }
+
+    # Filter metadata to only samples in feature table
+    meta_filtered <- meta %>% filter(SampleID %in% ft_samples)
     
     # Filter metadata to only samples in feature table
     meta_filtered <- meta %>% filter(SampleID %in% ft_samples)

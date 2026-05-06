@@ -82,10 +82,11 @@ plot_dpi:         300
 force_regenerate: false
 
 # ── Alignment ────────────────────────────────────────────────────────────────
-use_all_asvs: false   # use all ASVs for DECIPHER alignment (false = subsample)
+use_all_asvs: true   # use all ASVs for DECIPHER alignment (false = subsample)
 asv_sample_size:        5000    # subsample size when use_all_asvs is false
 
 # ── Pipeline stages ───────────────────────────────────────────────────────────
 run_validation: true    # run multi-tier ecological validation after merge
 auto_trim:      false   # set to true to automatically run trim/merge after verdict (skips manual review)
                         # when true, selection_mode defaults to "auto" (all KEEP studies included)
+validation_levels: "ASV,Genus,Family"   # comma-separated taxonomic levels for validation
